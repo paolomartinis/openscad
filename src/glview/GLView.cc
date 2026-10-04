@@ -285,6 +285,7 @@ void GLView::paintGL()
     showObject(obj, eyedir);
   }
   glDisable(GL_LIGHTING);
+  if (gizmo.visible) showGizmo();
   if (showaxes) GLView::showSmallaxes(axescolor);
 
   // Workaround for inconsistent QT behavior related to handling custom OpenGL widgets that
@@ -563,6 +564,53 @@ void GLView::showObject(const SelectedObject& obj, const Vector3d& eyedir)
     glEnd();
   } break;
   }
+}
+
+void GLView::showGizmo()
+{
+  // Drawn on top of the model so the handles stay reachable.
+  glDisable(GL_DEPTH_TEST);
+
+  const Vector3d lo = gizmo.bbox.min() + gizmo.offset;
+  const Vector3d hi = gizmo.bbox.max() + gizmo.offset;
+  glLineWidth(1.5f);
+  glColor4f(1.0f, 0.8f, 0.2f, 1.0f);
+  glBegin(GL_LINES);
+  for (int i = 0; i < 12; ++i) {
+    // The 12 box edges, 4 parallel to each axis.
+    const int axis = i / 4;
+    const int a = (axis + 1) % 3, b = (axis + 2) % 3;
+    Vector3d p = lo, q = lo;
+    p[a] = q[a] = (i & 1) ? hi[a] : lo[a];
+    p[b] = q[b] = (i & 2) ? hi[b] : lo[b];
+    q[axis] = hi[axis];
+    glVertex3d(p[0], p[1], p[2]);
+    glVertex3d(q[0], q[1], q[2]);
+  }
+  glEnd();
+
+  const Vector3d o = gizmoOrigin();
+  const double len = gizmoHandleLength();
+  const float colors[3][3] = {{0.95f, 0.25f, 0.25f}, {0.3f, 0.85f, 0.3f}, {0.3f, 0.5f, 1.0f}};
+  for (int axis = 0; axis < 3; ++axis) {
+    const bool hot = axis == gizmo.hoverAxis || axis == gizmo.activeAxis;
+    const float boost = hot ? 0.25f : 0.0f;
+    glColor4f(colors[axis][0] + boost, colors[axis][1] + boost, colors[axis][2] + boost, 1.0f);
+    Vector3d tip = o;
+    tip[axis] += len;
+    glLineWidth(hot ? 5.0f : 3.0f);
+    glBegin(GL_LINES);
+    glVertex3d(o[0], o[1], o[2]);
+    glVertex3d(tip[0], tip[1], tip[2]);
+    glEnd();
+    glPointSize(hot ? 14.0f : 11.0f);
+    glBegin(GL_POINTS);
+    glVertex3d(tip[0], tip[1], tip[2]);
+    glEnd();
+  }
+  glPointSize(1.0f);
+  glLineWidth(1.0f);
+  glEnable(GL_DEPTH_TEST);
 }
 
 void GLView::showScalemarkers(const Color4f& col)

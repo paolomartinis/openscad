@@ -228,6 +228,11 @@ void QGLView::paintGL()
 
 void QGLView::mousePressEvent(QMouseEvent *event)
 {
+  if (event->button() == Qt::LeftButton && measure_state == Measurement::MEASURE_IDLE &&
+      gizmoStartDrag(event->position())) {
+    return;
+  }
+
   if (!mouse_drag_active) {
     mouse_drag_moved = false;
   }
@@ -342,6 +347,17 @@ void QGLView::mouseMoveEvent(QMouseEvent *event)
 #else
   auto this_mouse = event->globalPos();
 #endif
+  if (gizmo.activeAxis >= 0) {
+    gizmoUpdateDrag(event->position());
+    return;
+  }
+  if (gizmo.visible && !mouse_drag_active) {
+    const int hover = gizmoHitAxis(event->position());
+    if (hover != gizmo.hoverAxis) {
+      gizmo.hoverAxis = hover;
+      update();
+    }
+  }
   if (measure_state != Measurement::MEASURE_IDLE) {
     QPoint pt = event->pos();
     this->shown_obj = findObject(pt.x(), pt.y());
@@ -432,6 +448,19 @@ void QGLView::mouseMoveEvent(QMouseEvent *event)
 
 void QGLView::mouseReleaseEvent(QMouseEvent *event)
 {
+  if (gizmo.activeAxis >= 0) {
+    gizmo.activeAxis = -1;
+    const Vector3d offset = gizmo.offset;
+    update();
+    if (offset.cwiseAbs().maxCoeff() > 1e-9) {
+      emit gizmoDragFinished(offset.x(), offset.y(), offset.z());
+    } else {
+      // A press on the selection without moving is a plain click.
+      emit doLeftClick(event->pos());
+    }
+    return;
+  }
+
   mouse_drag_active = false;
   releaseMouse();
 
@@ -641,6 +670,120 @@ void QGLView::selectPoint(int mouse_x, int mouse_y)
   std::vector<SelectedObject> obj = findObject(mouse_x, mouse_y);
   if (obj.size() == 1) {
     this->selected_obj.push_back(obj[0]);
+    update();
+  }
+}
+
+QPointF QGLView::projectToScreen(const Vector3d& p) const
+{
+  const Eigen::Map<const Eigen::Matrix4d> model(this->modelview);
+  const Eigen::Map<const Eigen::Matrix4d> proj(this->projection);
+  const Eigen::Vector4d clip = proj * model * Eigen::Vector4d(p.x(), p.y(), p.z(), 1.0);
+  if (std::fabs(clip.w()) < 1e-12) return {-1e9, -1e9};
+  const double nx = clip.x() / clip.w(), ny = clip.y() / clip.w();
+  return {(nx + 1.0) * 0.5 * width(), (1.0 - ny) * 0.5 * height()};
+}
+
+void QGLView::screenRay(const QPointF& pos, Vector3d& nearPt, Vector3d& farPt) const
+{
+  const Eigen::Map<const Eigen::Matrix4d> model(this->modelview);
+  const Eigen::Map<const Eigen::Matrix4d> proj(this->projection);
+  const Eigen::Matrix4d inv = (proj * model).inverse();
+  const double nx = 2.0 * pos.x() / width() - 1.0;
+  const double ny = 1.0 - 2.0 * pos.y() / height();
+  const Eigen::Vector4d n = inv * Eigen::Vector4d(nx, ny, -1.0, 1.0);
+  const Eigen::Vector4d f = inv * Eigen::Vector4d(nx, ny, 1.0, 1.0);
+  nearPt = n.head<3>() / n.w();
+  farPt = f.head<3>() / f.w();
+}
+
+bool QGLView::rayHitsPlaneZ(const QPointF& pos, double z, Vector3d& hit) const
+{
+  Vector3d nearPt, farPt;
+  screenRay(pos, nearPt, farPt);
+  const Vector3d dir = farPt - nearPt;
+  // Looking (almost) edge-on at the plane: no stable intersection.
+  if (std::fabs(dir.z()) < 1e-6 * dir.norm()) return false;
+  const double t = (z - nearPt.z()) / dir.z();
+  hit = nearPt + t * dir;
+  return true;
+}
+
+int QGLView::gizmoHitAxis(const QPointF& pos) const
+{
+  if (!gizmo.visible) return -1;
+  const Vector3d o = gizmoOrigin();
+  const QPointF so = projectToScreen(o);
+  int best = -1;
+  double bestDist = 10.0;  // pixels
+  for (int axis = 0; axis < 3; ++axis) {
+    Vector3d tip = o;
+    tip[axis] += gizmoHandleLength();
+    const QPointF st = projectToScreen(tip);
+    const QPointF seg = st - so;
+    const double len2 = QPointF::dotProduct(seg, seg);
+    if (len2 < 25.0) continue;  // handle points at the viewer
+    // Grab the outer 70% of the handle, so the origin stays a plane drag.
+    const double t = std::clamp(QPointF::dotProduct(pos - so, seg) / len2, 0.3, 1.0);
+    const QPointF d = pos - (so + t * seg);
+    const double dist = std::sqrt(QPointF::dotProduct(d, d));
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = axis;
+    }
+  }
+  return best;
+}
+
+bool QGLView::gizmoStartDrag(const QPointF& pos)
+{
+  if (!gizmo.visible) return false;
+
+  int mode = gizmoHitAxis(pos);
+  if (mode < 0 && !gizmoSelectionIndices.empty()) {
+    const int index = pickObject(pos.toPoint());
+    if (gizmoSelectionIndices.count(index)) {
+      gizmo_plane_z = gizmo.bbox.min().z();
+      if (rayHitsPlaneZ(pos, gizmo_plane_z, gizmo_plane_start)) mode = 3;
+    }
+  }
+  if (mode < 0) return false;
+
+  gizmo.activeAxis = mode;
+  gizmo.offset = Vector3d::Zero();
+  gizmo_press_pos = pos;
+  update();
+  return true;
+}
+
+void QGLView::gizmoUpdateDrag(const QPointF& pos)
+{
+  // 1 mm grid like Tinkercad, 0.1 mm with Ctrl.
+  const double step = (QApplication::keyboardModifiers() & Qt::ControlModifier) ? 0.1 : 1.0;
+  auto snap = [step](double v) { return std::round(v / step) * step; };
+
+  Vector3d offset = Vector3d::Zero();
+  if (gizmo.activeAxis == 3) {
+    Vector3d hit;
+    if (!rayHitsPlaneZ(pos, gizmo_plane_z, hit)) return;
+    offset.x() = snap(hit.x() - gizmo_plane_start.x());
+    offset.y() = snap(hit.y() - gizmo_plane_start.y());
+  } else {
+    const int axis = gizmo.activeAxis;
+    // Measure the mouse movement along the handle as drawn at press time.
+    const Vector3d o = gizmo.bbox.center();
+    Vector3d tip = o;
+    tip[axis] += gizmoHandleLength();
+    const QPointF so = projectToScreen(o), st = projectToScreen(tip);
+    const QPointF seg = st - so;
+    const double len2 = QPointF::dotProduct(seg, seg);
+    if (len2 < 1.0) return;
+    const double t = QPointF::dotProduct(pos - gizmo_press_pos, seg) / len2;
+    offset[axis] = snap(t * gizmoHandleLength());
+  }
+
+  if (offset != gizmo.offset) {
+    gizmo.offset = offset;
     update();
   }
 }

@@ -141,6 +141,8 @@
 #include "gui/QSettingsCached.h"
 #include "gui/QWordSearchField.h"
 #include "gui/ScintillaEditor.h"
+#include "gui/VisualEdit.h"
+#include "core/TransformNode.h"
 #include "gui/SettingsWriter.h"
 #include "gui/TabManager.h"
 #include "gui/UIUtils.h"
@@ -1916,6 +1918,7 @@ void MainWindow::actionRenderPreview()
 void MainWindow::csgRender()
 {
   if (this->rootNode) compileCSG();
+  refreshVisualSelection();
 
   selectPreviewViewMode();
 
@@ -2109,6 +2112,10 @@ void MainWindow::handleMeasurementClicked(QAction *clickedAction)
 
 void MainWindow::leftClick(QPoint mouse)
 {
+  if (this->qglview->measure_state == Measurement::MEASURE_IDLE && !activeMeasurement) {
+    visualSelectAt(mouse);
+    return;
+  }
   auto state = meas.statemachine(mouse);
   if (state.status != Measurement::Result::Status::NoChange) {
     this->qglview->measure_state = Measurement::MEASURE_DIRTY;
@@ -2242,6 +2249,197 @@ void MainWindow::rightClick(QPoint position)
   } else {
     clearAllSelectionIndicators();
   }
+}
+
+// ── Visual editing ──────────────────────────────────────────────────────────
+
+bool MainWindow::isMainFileLocation(const Location& loc) const
+{
+  if (loc.isNone() || !renderedEditor) return false;
+  const QString& editorPath = renderedEditor->filepath;
+  if (editorPath.isEmpty()) {
+    // Unsaved documents are parsed with the working directory as their path.
+    return loc.filePath().empty() || fs::is_directory(loc.filePath());
+  }
+  return fs::path(editorPath.toStdString()).lexically_normal() == loc.filePath().lexically_normal();
+}
+
+// Statements of the main file that lead to the picked leaf, outermost first.
+std::vector<std::shared_ptr<const AbstractNode>> MainWindow::visualSelectionChain(
+  const std::deque<std::shared_ptr<const AbstractNode>>& path) const
+{
+  std::vector<std::shared_ptr<const AbstractNode>> chain;
+  const ModuleInstantiation *previous = nullptr;
+  for (auto it = path.rbegin(); it != path.rend(); ++it) {
+    const auto& node = *it;
+    if (!node->modinst || node->modinst == previous) continue;
+    if (!isMainFileLocation(node->modinst->location())) continue;
+    previous = node->modinst;
+    chain.push_back(node);
+  }
+  return chain;
+}
+
+void MainWindow::visualSelectAt(QPoint position)
+{
+  if (!this->rootNode || !this->qglview->renderer) return;
+  const int index = this->qglview->pickObject(position);
+  std::deque<std::shared_ptr<const AbstractNode>> path;
+  const auto picked = index >= 0 ? this->rootNode->getNodeByID(index, path) : nullptr;
+  const auto chain = picked ? visualSelectionChain(path) : decltype(visualSelectionChain(path)){};
+  if (chain.empty()) {
+    clearVisualSelection();
+    return;
+  }
+
+  // Clicking the selected object again goes one statement deeper, like
+  // entering a group in Tinkercad; anything else selects the outermost one.
+  size_t next = 0;
+  for (size_t i = 0; i < chain.size(); ++i) {
+    if (chain[i]->index() == visualSelection.nodeIndex) {
+      next = std::min(i + 1, chain.size() - 1);
+      break;
+    }
+  }
+  visualSelectNode(chain[next]);
+}
+
+void MainWindow::visualSelectNode(const std::shared_ptr<const AbstractNode>& node)
+{
+  const Location& loc = node->modinst->location();
+  visualSelection = {node->index(), loc.firstLine(), loc.firstColumn()};
+
+  // Leaves below the node, for picking and for the bounding box.
+  std::set<int> leaves;
+  std::vector<std::shared_ptr<const AbstractNode>> stack{node};
+  while (!stack.empty()) {
+    const auto current = stack.back();
+    stack.pop_back();
+    leaves.insert(current->index());
+    for (const auto& child : current->getChildren()) stack.push_back(child);
+  }
+
+  BoundingBox bbox;
+  for (const auto& products : {rootProduct, highlightsProducts, backgroundProducts}) {
+    if (!products) continue;
+    for (const auto& product : products->products) {
+      for (const auto *list : {&product.intersections, &product.subtractions}) {
+        for (const auto& object : *list) {
+          if (object.leaf && leaves.count(object.leaf->index)) {
+            bbox.extend(object.leaf->getBoundingBox());
+          }
+        }
+      }
+    }
+  }
+
+  auto& gizmo = this->qglview->gizmo;
+  gizmo.visible = !bbox.isEmpty();
+  gizmo.bbox = bbox;
+  gizmo.offset = Vector3d::Zero();
+  gizmo.activeAxis = -1;
+  this->qglview->gizmoSelectionIndices = leaves;
+  this->qglview->update();
+
+  currentlySelectedObject = -1;
+  setSelection(node->index());
+
+  std::vector<std::shared_ptr<const AbstractNode>> sameStatement;
+  this->rootNode->findNodesWithSameMod(node, sameStatement);
+  QString message = QString("Selected %1 (line %2): drag the object or an arrow to move it, "
+                            "click again to go inside")
+                      .arg(QString::fromStdString(node->modinst->name()))
+                      .arg(loc.firstLine());
+  if (sameStatement.size() > 1) {
+    message += QString(" - this statement creates %1 objects, all of them will move")
+                 .arg(sameStatement.size());
+  }
+  this->statusBar()->showMessage(message);
+}
+
+// After a re-compile node indices change: find the statement again by its
+// position in the source.
+void MainWindow::refreshVisualSelection()
+{
+  if (visualSelection.nodeIndex < 0) return;
+  std::shared_ptr<const AbstractNode> found;
+  if (this->rootNode) {
+    std::vector<std::shared_ptr<const AbstractNode>> stack{this->rootNode};
+    while (!stack.empty() && !found) {
+      const auto current = stack.back();
+      stack.pop_back();
+      if (current->modinst && isMainFileLocation(current->modinst->location()) &&
+          current->modinst->location().firstLine() == visualSelection.line &&
+          current->modinst->location().firstColumn() == visualSelection.column) {
+        found = current;
+        break;
+      }
+      // Depth-first, children in source order.
+      const auto& children = current->getChildren();
+      for (auto it = children.rbegin(); it != children.rend(); ++it) stack.push_back(*it);
+    }
+  }
+  if (found) visualSelectNode(found);
+  else clearVisualSelection();
+}
+
+void MainWindow::clearVisualSelection()
+{
+  visualSelection = {};
+  this->qglview->gizmo = {};
+  this->qglview->gizmoSelectionIndices.clear();
+  this->qglview->update();
+  if (renderedEditor) renderedEditor->clearAllSelectionIndicators();
+  currentlySelectedObject = -1;
+}
+
+void MainWindow::onGizmoDragFinished(double dx, double dy, double dz)
+{
+  auto resetGizmo = [this]() {
+    this->qglview->gizmo.offset = Vector3d::Zero();
+    this->qglview->update();
+  };
+  auto *editor = dynamic_cast<ScintillaEditor *>(renderedEditor);
+  if (!editor || !this->rootNode || visualSelection.nodeIndex < 0) return resetGizmo();
+  if (editor->toPlainText() != lastCompiledDoc) {
+    // Source locations refer to the last compiled text.
+    this->statusBar()->showMessage("The code changed since the last preview: press F5, then move again");
+    return resetGizmo();
+  }
+
+  std::deque<std::shared_ptr<const AbstractNode>> path;
+  const auto node = this->rootNode->getNodeByID(visualSelection.nodeIndex, path);
+  if (!node || !node->modinst) return resetGizmo();
+
+  // Express the world offset in the frame of the statement's parent.
+  Transform3d parent = Transform3d::Identity();
+  for (auto it = path.rbegin(); it != path.rend(); ++it) {
+    if (*it == node) break;
+    if (const auto *transform = dynamic_cast<const TransformNode *>(it->get())) {
+      parent = parent * transform->matrix;
+    }
+  }
+  const Eigen::Matrix3d linear = parent.linear();
+  if (std::fabs(linear.determinant()) < 1e-12) return resetGizmo();
+  const Vector3d local = linear.inverse() * Vector3d(dx, dy, dz);
+
+  const auto edits = VisualEdit::planTranslate(*node->modinst, local);
+  if (edits.empty()) return resetGizmo();
+
+  QsciScintilla *qsci = editor->qsci;
+  auto position = [qsci](int line, int column) {
+    return qsci->SendScintilla(QsciScintillaBase::SCI_POSITIONFROMLINE, line - 1) + column - 1;
+  };
+  qsci->beginUndoAction();
+  for (auto it = edits.rbegin(); it != edits.rend(); ++it) {
+    qsci->SendScintilla(QsciScintillaBase::SCI_SETTARGETSTART, position(it->firstLine, it->firstColumn));
+    qsci->SendScintilla(QsciScintillaBase::SCI_SETTARGETEND, position(it->lastLine, it->lastColumn));
+    qsci->SendScintilla(QsciScintillaBase::SCI_REPLACETARGET, it->text.size(), it->text.c_str());
+  }
+  qsci->endUndoAction();
+
+  // The gizmo keeps showing the offset until the new preview arrives.
+  actionRenderPreview();
 }
 
 void MainWindow::measureFinished()
@@ -3780,6 +3978,7 @@ void MainWindow::setup3DView()
   connect(this->qglview, &QGLView::resized, viewportControlWidget, &ViewportControl::viewResized);
   connect(this->qglview, &QGLView::doRightClick, this, &MainWindow::rightClick);
   connect(this->qglview, &QGLView::doLeftClick, this, &MainWindow::leftClick);
+  connect(this->qglview, &QGLView::gizmoDragFinished, this, &MainWindow::onGizmoDragFinished);
   connect(this->qglview, &QGLView::initialized, this, &MainWindow::updateViewModeAfterGLInit);
 }
 

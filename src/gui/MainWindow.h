@@ -427,6 +427,7 @@ public slots:
   void editorContentChanged();
   void leftClick(QPoint coordinate);
   void rightClick(QPoint coordinate);
+  void onGizmoDragFinished(double dx, double dy, double dz);
   void dragEnterEvent(QDragEnterEvent *event) override;
   void dropEvent(QDropEvent *event) override;
   void on_helpActionAbout_triggered();
@@ -456,6 +457,21 @@ private:
   std::shared_ptr<CSGProducts> highlightsProducts;
   std::shared_ptr<CSGProducts> backgroundProducts;
   int currentlySelectedObject{-1};
+
+  // Visual editor selection. The selected statement is remembered by where it
+  // starts in the source, so it can be found again after every re-compile.
+  struct VisualSelection {
+    int nodeIndex = -1;
+    int line = 0;
+    int column = 0;
+  } visualSelection;
+  std::vector<std::shared_ptr<const AbstractNode>> visualSelectionChain(
+    const std::deque<std::shared_ptr<const AbstractNode>>& path) const;
+  bool isMainFileLocation(const Location& loc) const;
+  void visualSelectAt(QPoint position);
+  void visualSelectNode(const std::shared_ptr<const AbstractNode>& node);
+  void refreshVisualSelection();
+  void clearVisualSelection();
 
   char const *afterCompileSlot;
   bool procevents{false};

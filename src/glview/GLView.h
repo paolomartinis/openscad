@@ -81,6 +81,20 @@ public:
   std::vector<SelectedObject> selected_obj;
   std::vector<SelectedObject> shown_obj;
 
+  // Move gizmo for the visual editor: selection bounds, axis handles and the
+  // live offset while dragging (the model itself is re-rendered on release).
+  struct MoveGizmo {
+    bool visible = false;
+    BoundingBox bbox;
+    Vector3d offset = Vector3d::Zero();
+    int hoverAxis = -1;   // 0..2 = X/Y/Z handle under the mouse
+    int activeAxis = -1;  // 0..2 = axis drag, 3 = drag on the XY plane
+  };
+  MoveGizmo gizmo;
+  // Handle origin (bounding box center plus the live offset) and length.
+  [[nodiscard]] Vector3d gizmoOrigin() const { return gizmo.bbox.center() + gizmo.offset; }
+  [[nodiscard]] double gizmoHandleLength() const { return cam.zoomValue() * 0.12; }
+
 #ifdef ENABLE_OPENCSG
   bool is_opencsg_capable;
   bool has_shaders;
@@ -89,6 +103,7 @@ public:
   int opencsg_id;
 #endif
   void showObject(const SelectedObject& pt, const Vector3d& eyedir);
+  void showGizmo();
 
 private:
   void showCrosshairs(const Color4f& col);

@@ -19,6 +19,7 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <set>
 #include "glview/GLView.h"
 #include "../core/MouseConfig.h"
 
@@ -54,6 +55,10 @@ public:
   int measure_state;
 
   int pickObject(QPoint position);
+
+  // Leaf node indices of the current visual-editor selection; pressing on
+  // one of them starts a drag on the XY plane.
+  std::set<int> gizmoSelectionIndices;
 
 public slots:
   void ZoomIn();
@@ -102,6 +107,17 @@ private:
   void initializeGL() override;
   void resizeGL(int w, int h) override;
 
+  // Move gizmo interaction (see GLView::MoveGizmo).
+  QPointF projectToScreen(const Vector3d& p) const;
+  void screenRay(const QPointF& pos, Vector3d& nearPt, Vector3d& farPt) const;
+  bool rayHitsPlaneZ(const QPointF& pos, double z, Vector3d& hit) const;
+  int gizmoHitAxis(const QPointF& pos) const;
+  bool gizmoStartDrag(const QPointF& pos);
+  void gizmoUpdateDrag(const QPointF& pos);
+  QPointF gizmo_press_pos;
+  Vector3d gizmo_plane_start;
+  double gizmo_plane_z = 0.0;
+
   void paintGL() override;
   void normalizeAngle(GLdouble& angle);
 
@@ -117,6 +133,8 @@ signals:
   void resized();
   void doRightClick(QPoint screen_coordinate);
   void doLeftClick(QPoint screen_coordinate);
+  // Gizmo drag released with a non-zero offset (world coordinates, mm).
+  void gizmoDragFinished(double dx, double dy, double dz);
   void initialized();
 };
 
