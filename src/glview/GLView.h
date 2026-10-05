@@ -81,19 +81,49 @@ public:
   std::vector<SelectedObject> selected_obj;
   std::vector<SelectedObject> shown_obj;
 
-  // Move gizmo for the visual editor: selection bounds, axis handles and the
-  // live offset while dragging (the model itself is re-rendered on release).
-  struct MoveGizmo {
+  // Transform gizmo of the visual editor: selection bounds, move arrows,
+  // rotation rings and size handles. While an edit is in progress only the
+  // gizmo shows it (as a "ghost" box); the model is re-rendered once the edit
+  // has been written to the source.
+  struct TransformGizmo {
+    enum Handle {
+      None = -1,
+      MoveX, MoveY, MoveZ, MovePlane,
+      RotateX, RotateY, RotateZ,
+      SizeX, SizeY, SizeZ
+    };
+    static bool isMove(int h) { return h >= MoveX && h <= MovePlane; }
+    static bool isRotate(int h) { return h >= RotateX && h <= RotateZ; }
+    static bool isSize(int h) { return h >= SizeX && h <= SizeZ; }
+    // World axis 0..2 of a handle (MovePlane -> 3).
+    static int axisOf(int h)
+    {
+      return isMove(h) ? h - MoveX : isRotate(h) ? h - RotateX : isSize(h) ? h - SizeX : -1;
+    }
+
     bool visible = false;
     BoundingBox bbox;
-    Vector3d offset = Vector3d::Zero();
-    int hoverAxis = -1;   // 0..2 = X/Y/Z handle under the mouse
-    int activeAxis = -1;  // 0..2 = axis drag, 3 = drag on the XY plane
+    int hover = None;
+    int active = None;
+    Vector3d offset = Vector3d::Zero();  // move, world mm
+    double angle = 0.0;                  // rotate, degrees about the handle axis
+    Vector3d size = Vector3d::Zero();    // resize: target size, min corner fixed
+
+    [[nodiscard]] Vector3d bboxSize() const { return bbox.isEmpty() ? Vector3d::Zero() : Vector3d(bbox.sizes()); }
+    void resetEdit()
+    {
+      offset = Vector3d::Zero();
+      angle = 0.0;
+      size = bboxSize();
+    }
+    [[nodiscard]] bool hasEdit() const;
+    // Where point p ends up with the edit in progress.
+    [[nodiscard]] Vector3d transformPoint(const Vector3d& p) const;
   };
-  MoveGizmo gizmo;
-  // Handle origin (bounding box center plus the live offset) and length.
-  [[nodiscard]] Vector3d gizmoOrigin() const { return gizmo.bbox.center() + gizmo.offset; }
+  TransformGizmo gizmo;
+  [[nodiscard]] Vector3d gizmoOrigin() const { return gizmo.bbox.center(); }
   [[nodiscard]] double gizmoHandleLength() const { return cam.zoomValue() * 0.12; }
+  [[nodiscard]] double gizmoRingRadius() const { return gizmoHandleLength() * 0.8; }
 
 #ifdef ENABLE_OPENCSG
   bool is_opencsg_capable;

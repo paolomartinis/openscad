@@ -566,48 +566,132 @@ void GLView::showObject(const SelectedObject& obj, const Vector3d& eyedir)
   }
 }
 
+bool GLView::TransformGizmo::hasEdit() const
+{
+  if (isMove(active)) return offset.cwiseAbs().maxCoeff() > 1e-9;
+  if (isRotate(active)) return std::fabs(angle) > 1e-9;
+  if (isSize(active)) return (size - bboxSize()).cwiseAbs().maxCoeff() > 1e-9;
+  return false;
+}
+
+Vector3d GLView::TransformGizmo::transformPoint(const Vector3d& p) const
+{
+  if (isMove(active)) return p + offset;
+  if (isRotate(active)) {
+    const Vector3d c = bbox.center();
+    return c + Eigen::AngleAxisd(angle * M_PI / 180.0, Vector3d::Unit(axisOf(active))) * (p - c);
+  }
+  if (isSize(active)) {
+    const Vector3d lo = bbox.min();
+    const Vector3d old = bboxSize();
+    Vector3d q = p;
+    for (int i = 0; i < 3; ++i) {
+      if (old[i] > 1e-12) q[i] = lo[i] + (p[i] - lo[i]) * size[i] / old[i];
+    }
+    return q;
+  }
+  return p;
+}
+
 void GLView::showGizmo()
 {
+  using G = TransformGizmo;
   // Drawn on top of the model so the handles stay reachable.
   glDisable(GL_DEPTH_TEST);
 
-  const Vector3d lo = gizmo.bbox.min() + gizmo.offset;
-  const Vector3d hi = gizmo.bbox.max() + gizmo.offset;
+  const Vector3d lo = gizmo.bbox.min();
+  const Vector3d hi = gizmo.bbox.max();
+  auto corner = [&](int i) { return Vector3d(i & 1 ? hi[0] : lo[0], i & 2 ? hi[1] : lo[1], i & 4 ? hi[2] : lo[2]); };
+  auto drawBox = [&](bool transformed) {
+    glBegin(GL_LINES);
+    for (int i = 0; i < 8; ++i) {
+      for (int bit = 1; bit < 8; bit <<= 1) {
+        if (i & bit) continue;
+        Vector3d p = corner(i), q = corner(i | bit);
+        if (transformed) {
+          p = gizmo.transformPoint(p);
+          q = gizmo.transformPoint(q);
+        }
+        glVertex3d(p[0], p[1], p[2]);
+        glVertex3d(q[0], q[1], q[2]);
+      }
+    }
+    glEnd();
+  };
+
+  const bool editing = gizmo.active != G::None;
+  if (editing) {
+    // Original bounds, faint, under the ghost.
+    glLineWidth(1.0f);
+    glColor4f(0.6f, 0.6f, 0.6f, 1.0f);
+    drawBox(false);
+  }
   glLineWidth(1.5f);
   glColor4f(1.0f, 0.8f, 0.2f, 1.0f);
-  glBegin(GL_LINES);
-  for (int i = 0; i < 12; ++i) {
-    // The 12 box edges, 4 parallel to each axis.
-    const int axis = i / 4;
-    const int a = (axis + 1) % 3, b = (axis + 2) % 3;
-    Vector3d p = lo, q = lo;
-    p[a] = q[a] = (i & 1) ? hi[a] : lo[a];
-    p[b] = q[b] = (i & 2) ? hi[b] : lo[b];
-    q[axis] = hi[axis];
-    glVertex3d(p[0], p[1], p[2]);
-    glVertex3d(q[0], q[1], q[2]);
-  }
-  glEnd();
+  drawBox(true);
 
-  const Vector3d o = gizmoOrigin();
-  const double len = gizmoHandleLength();
   const float colors[3][3] = {{0.95f, 0.25f, 0.25f}, {0.3f, 0.85f, 0.3f}, {0.3f, 0.5f, 1.0f}};
-  for (int axis = 0; axis < 3; ++axis) {
-    const bool hot = axis == gizmo.hoverAxis || axis == gizmo.activeAxis;
+  auto setColor = [&](int axis, bool hot) {
     const float boost = hot ? 0.25f : 0.0f;
     glColor4f(colors[axis][0] + boost, colors[axis][1] + boost, colors[axis][2] + boost, 1.0f);
+  };
+  auto shown = [&](int handle) { return !editing || gizmo.active == handle; };
+  auto hot = [&](int handle) { return gizmo.hover == handle || gizmo.active == handle; };
+
+  const Vector3d c = gizmoOrigin();
+  const double len = gizmoHandleLength();
+
+  // Move arrows.
+  for (int axis = 0; axis < 3; ++axis) {
+    const int handle = G::MoveX + axis;
+    if (!shown(handle)) continue;
+    const Vector3d o = gizmo.transformPoint(c);
     Vector3d tip = o;
     tip[axis] += len;
-    glLineWidth(hot ? 5.0f : 3.0f);
+    setColor(axis, hot(handle));
+    glLineWidth(hot(handle) ? 5.0f : 3.0f);
     glBegin(GL_LINES);
     glVertex3d(o[0], o[1], o[2]);
     glVertex3d(tip[0], tip[1], tip[2]);
     glEnd();
-    glPointSize(hot ? 14.0f : 11.0f);
+    glPointSize(hot(handle) ? 14.0f : 11.0f);
     glBegin(GL_POINTS);
     glVertex3d(tip[0], tip[1], tip[2]);
     glEnd();
   }
+
+  // Rotation rings, in the plane perpendicular to each axis.
+  const double radius = gizmoRingRadius();
+  for (int axis = 0; axis < 3; ++axis) {
+    const int handle = G::RotateX + axis;
+    if (!shown(handle)) continue;
+    const Vector3d u = Vector3d::Unit((axis + 1) % 3), v = Vector3d::Unit((axis + 2) % 3);
+    setColor(axis, hot(handle));
+    glLineWidth(hot(handle) ? 4.0f : 1.5f);
+    glBegin(GL_LINE_LOOP);
+    for (int i = 0; i < 72; ++i) {
+      const double a = i * 2.0 * M_PI / 72.0;
+      const Vector3d p = c + radius * (std::cos(a) * u + std::sin(a) * v);
+      glVertex3d(p[0], p[1], p[2]);
+    }
+    glEnd();
+  }
+
+  // Size handles on the +X/+Y/+Z faces (the opposite face stays put).
+  for (int axis = 0; axis < 3; ++axis) {
+    const int handle = G::SizeX + axis;
+    if (!shown(handle)) continue;
+    Vector3d p = c;
+    p[axis] = hi[axis];
+    p = gizmo.transformPoint(p);
+    if (hot(handle)) glColor4f(1.0f, 0.85f, 0.2f, 1.0f);
+    else glColor4f(0.95f, 0.95f, 0.95f, 1.0f);
+    glPointSize(hot(handle) ? 14.0f : 10.0f);
+    glBegin(GL_POINTS);
+    glVertex3d(p[0], p[1], p[2]);
+    glEnd();
+  }
+
   glPointSize(1.0f);
   glLineWidth(1.0f);
   glEnable(GL_DEPTH_TEST);

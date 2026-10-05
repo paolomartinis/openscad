@@ -2334,10 +2334,10 @@ void MainWindow::visualSelectNode(const std::shared_ptr<const AbstractNode>& nod
   }
 
   auto& gizmo = this->qglview->gizmo;
+  gizmo = {};
   gizmo.visible = !bbox.isEmpty();
   gizmo.bbox = bbox;
-  gizmo.offset = Vector3d::Zero();
-  gizmo.activeAxis = -1;
+  gizmo.resetEdit();
   this->qglview->gizmoSelectionIndices = leaves;
   this->qglview->update();
 
@@ -2346,8 +2346,8 @@ void MainWindow::visualSelectNode(const std::shared_ptr<const AbstractNode>& nod
 
   std::vector<std::shared_ptr<const AbstractNode>> sameStatement;
   this->rootNode->findNodesWithSameMod(node, sameStatement);
-  QString message = QString("Selected %1 (line %2): drag the object or an arrow to move it, "
-                            "click again to go inside")
+  QString message = QString("Selected %1 (line %2): drag arrows/object to move, rings to rotate, "
+                            "white squares to resize; type a value while dragging; click again to go inside")
                       .arg(QString::fromStdString(node->modinst->name()))
                       .arg(loc.firstLine());
   if (sameStatement.size() > 1) {
@@ -2393,25 +2393,26 @@ void MainWindow::clearVisualSelection()
   currentlySelectedObject = -1;
 }
 
-void MainWindow::onGizmoDragFinished(double dx, double dy, double dz)
+void MainWindow::onGizmoCommitted(int handle, double a, double b, double c)
 {
-  auto resetGizmo = [this]() {
-    this->qglview->gizmo.offset = Vector3d::Zero();
-    this->qglview->update();
+  using G = GLView::TransformGizmo;
+  auto fail = [this](const QString& message) {
+    if (!message.isEmpty()) this->statusBar()->showMessage(message);
+    this->qglview->gizmoCancel();
   };
   auto *editor = dynamic_cast<ScintillaEditor *>(renderedEditor);
-  if (!editor || !this->rootNode || visualSelection.nodeIndex < 0) return resetGizmo();
+  if (!editor || !this->rootNode || visualSelection.nodeIndex < 0) return fail({});
   if (editor->toPlainText() != lastCompiledDoc) {
     // Source locations refer to the last compiled text.
-    this->statusBar()->showMessage("The code changed since the last preview: press F5, then move again");
-    return resetGizmo();
+    return fail("The code changed since the last preview: press F5, then try again");
   }
 
   std::deque<std::shared_ptr<const AbstractNode>> path;
   const auto node = this->rootNode->getNodeByID(visualSelection.nodeIndex, path);
-  if (!node || !node->modinst) return resetGizmo();
+  if (!node || !node->modinst) return fail({});
 
-  // Express the world offset in the frame of the statement's parent.
+  // Gizmo values are in world coordinates; the source needs them in the
+  // frame of the statement's parent.
   Transform3d parent = Transform3d::Identity();
   for (auto it = path.rbegin(); it != path.rend(); ++it) {
     if (*it == node) break;
@@ -2420,11 +2421,32 @@ void MainWindow::onGizmoDragFinished(double dx, double dy, double dz)
     }
   }
   const Eigen::Matrix3d linear = parent.linear();
-  if (std::fabs(linear.determinant()) < 1e-12) return resetGizmo();
-  const Vector3d local = linear.inverse() * Vector3d(dx, dy, dz);
+  if (std::fabs(linear.determinant()) < 1e-12) return fail("This object is scaled to zero");
+  const Eigen::Matrix3d toLocal = linear.inverse();
+  const BoundingBox& bbox = this->qglview->gizmo.bbox;
+  static const char *axisNames[] = {"X", "Y", "Z"};
 
-  const auto edits = VisualEdit::planTranslate(*node->modinst, local);
-  if (edits.empty()) return resetGizmo();
+  std::vector<VisualEdit::TextEdit> edits;
+  QString done;
+  if (G::isMove(handle)) {
+    edits = VisualEdit::planTranslate(*node->modinst, toLocal * Vector3d(a, b, c));
+    done = QString("Moved by [%1, %2, %3]").arg(a).arg(b).arg(c);
+  } else if (G::isRotate(handle)) {
+    const Vector3d axis = toLocal * Vector3d::Unit(G::axisOf(handle));
+    const double angle = linear.determinant() < 0 ? -a : a;  // mirrored parent
+    edits = VisualEdit::planRotate(*node->modinst, parent.inverse() * bbox.center(), axis, angle);
+    done = QString("Rotated %1%2 about %3").arg(a).arg(QChar(0xb0)).arg(axisNames[G::axisOf(handle)]);
+  } else if (G::isSize(handle)) {
+    // Scaling along world axes must stay axis-aligned in the parent frame.
+    const Eigen::Matrix3d scale = toLocal * Vector3d(a, b, c).asDiagonal() * linear;
+    const Eigen::Matrix3d offDiagonal = scale - Eigen::Matrix3d(scale.diagonal().asDiagonal());
+    if (offDiagonal.cwiseAbs().maxCoeff() > 1e-6) {
+      return fail("Resizing a rotated object along world axes is not supported yet");
+    }
+    edits = VisualEdit::planScale(*node->modinst, parent.inverse() * bbox.min(), scale.diagonal());
+    done = QString("Resized by [%1, %2, %3]").arg(a).arg(b).arg(c);
+  }
+  if (edits.empty()) return fail({});
 
   QsciScintilla *qsci = editor->qsci;
   auto position = [qsci](int line, int column) {
@@ -2437,8 +2459,9 @@ void MainWindow::onGizmoDragFinished(double dx, double dy, double dz)
     qsci->SendScintilla(QsciScintillaBase::SCI_REPLACETARGET, it->text.size(), it->text.c_str());
   }
   qsci->endUndoAction();
+  this->statusBar()->showMessage(done + " - Ctrl+Z to undo");
 
-  // The gizmo keeps showing the offset until the new preview arrives.
+  // The gizmo keeps showing the ghost until the new preview arrives.
   actionRenderPreview();
 }
 
@@ -3978,7 +4001,7 @@ void MainWindow::setup3DView()
   connect(this->qglview, &QGLView::resized, viewportControlWidget, &ViewportControl::viewResized);
   connect(this->qglview, &QGLView::doRightClick, this, &MainWindow::rightClick);
   connect(this->qglview, &QGLView::doLeftClick, this, &MainWindow::leftClick);
-  connect(this->qglview, &QGLView::gizmoDragFinished, this, &MainWindow::onGizmoDragFinished);
+  connect(this->qglview, &QGLView::gizmoCommitted, this, &MainWindow::onGizmoCommitted);
   connect(this->qglview, &QGLView::initialized, this, &MainWindow::updateViewModeAfterGLInit);
 }
 

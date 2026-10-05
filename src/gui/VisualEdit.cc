@@ -3,12 +3,14 @@
 #include <cmath>
 #include <cstdio>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "core/AST.h"
 #include "core/Assignment.h"
 #include "core/Expression.h"
+#include "core/LocalScope.h"
 #include "core/ModuleInstantiation.h"
 
 namespace VisualEdit {
@@ -16,16 +18,67 @@ namespace VisualEdit {
 namespace {
 
 constexpr double kEpsilon = 1e-9;
+constexpr double kPositionTolerance = 1e-4;  // mm
 
-// The vector argument of translate(): first positional argument or "v".
-const Vector *translateVector(const ModuleInstantiation& inst)
+// Named argument `name`, or else the positional argument number `position`.
+const Expression *argument(const ModuleInstantiation& inst, const char *name, size_t position)
 {
+  size_t positional = 0;
+  const Expression *byPosition = nullptr;
   for (const auto& arg : inst.arguments) {
-    if (arg->getName().empty() || arg->getName() == "v") {
-      return dynamic_cast<const Vector *>(arg->getExpr().get());
+    if (arg->getName() == name) return arg->getExpr().get();
+    if (arg->getName().empty()) {
+      if (positional == position) byPosition = arg->getExpr().get();
+      ++positional;
     }
   }
-  return nullptr;
+  return byPosition;
+}
+
+std::optional<double> literalNumber(const Expression *expr)
+{
+  const auto *literal = dynamic_cast<const Literal *>(expr);
+  if (literal && literal->isDouble()) return literal->toDouble();
+  return std::nullopt;
+}
+
+// [x, y] or [x, y, z] made of number literals ([x, y] has z = 0).
+std::optional<Vector3d> literalVector(const Expression *expr, bool requireThree = false)
+{
+  const auto *vec = dynamic_cast<const Vector *>(expr);
+  if (!vec) return std::nullopt;
+  const auto& children = vec->getChildren();
+  if (children.size() != 3 && (requireThree || children.size() != 2)) return std::nullopt;
+  Vector3d result = Vector3d::Zero();
+  for (size_t i = 0; i < children.size(); ++i) {
+    const auto value = literalNumber(children[i].get());
+    if (!value) return std::nullopt;
+    result[static_cast<int>(i)] = *value;
+  }
+  return result;
+}
+
+// center absent or a literal false.
+bool notCentered(const ModuleInstantiation& inst, size_t position)
+{
+  const Expression *center = argument(inst, "center", position);
+  if (!center) return true;
+  const auto *literal = dynamic_cast<const Literal *>(center);
+  return literal && literal->isBool() && !literal->toBool();
+}
+
+// The single child statement of `inst` ("translate(..) cube(..);").
+const ModuleInstantiation *onlyChild(const ModuleInstantiation& inst)
+{
+  if (!inst.scope || !inst.scope->assignments.empty() || inst.scope->moduleInstantiations.size() != 1) {
+    return nullptr;
+  }
+  return inst.scope->moduleInstantiations.front().get();
+}
+
+std::string vectorText(const Vector3d& v)
+{
+  return "[" + formatNumber(v[0]) + ", " + formatNumber(v[1]) + ", " + formatNumber(v[2]) + "]";
 }
 
 TextEdit replaceAt(const Location& loc, std::string text)
@@ -33,15 +86,90 @@ TextEdit replaceAt(const Location& loc, std::string text)
   return {loc.firstLine(), loc.firstColumn(), loc.lastLine(), loc.lastColumn(), std::move(text)};
 }
 
+// New values for a literal [x, y, z]. Elements are replaced one by one: the
+// parser's location of a Vector does not span the whole "[...]".
+std::vector<TextEdit> replaceVector(const Expression *expr, const Vector3d& value)
+{
+  std::vector<TextEdit> edits;
+  const auto *vec = dynamic_cast<const Vector *>(expr);
+  if (!vec) return edits;
+  const auto& children = vec->getChildren();
+  for (size_t i = 0; i < children.size() && i < 3; ++i) {
+    edits.push_back(replaceAt(children[i]->location(), formatNumber(value[static_cast<int>(i)])));
+  }
+  return edits;
+}
+
 TextEdit insertAt(int line, int column, std::string text)
 {
   return {line, column, line, column, std::move(text)};
+}
+
+TextEdit prefixStatement(const ModuleInstantiation& inst, std::string text)
+{
+  const Location& loc = inst.location();
+  return insertAt(loc.firstLine(), loc.firstColumn(), std::move(text));
 }
 
 // " + 5" or " - 5"
 std::string signedTerm(double d)
 {
   return (d < 0 ? " - " : " + ") + formatNumber(std::fabs(d));
+}
+
+// "translate(P) <middle>(<vector>) translate(-P) ..." with literal vectors.
+struct Sandwich {
+  Vector3d pivot;
+  Vector3d value;
+  const Expression *valueExpr;
+};
+
+std::optional<Sandwich> matchSandwich(const ModuleInstantiation& inst, const std::string& middleName)
+{
+  if (inst.name() != "translate") return std::nullopt;
+  const auto pivot = literalVector(argument(inst, "v", 0));
+  const ModuleInstantiation *middle = onlyChild(inst);
+  if (!pivot || !middle || middle->name() != middleName) return std::nullopt;
+  const Expression *valueExpr = argument(*middle, middleName == "rotate" ? "a" : "v", 0);
+  const auto value = literalVector(valueExpr, true);
+  const ModuleInstantiation *back = onlyChild(*middle);
+  if (!value || !back || back->name() != "translate") return std::nullopt;
+  const auto backVector = literalVector(argument(*back, "v", 0));
+  if (!backVector || (*backVector + *pivot).norm() > kPositionTolerance) return std::nullopt;
+  return Sandwich{*pivot, *value, valueExpr};
+}
+
+std::string sandwichText(const Vector3d& pivot, const std::string& middle, const Vector3d& value)
+{
+  return "translate(" + vectorText(pivot) + ") " + middle + "(" + vectorText(value) + ") translate(" +
+         vectorText(-pivot) + ") ";
+}
+
+constexpr double kDegToRad = M_PI / 180.0;
+
+// OpenSCAD rotate([x, y, z]) = Rz * Ry * Rx.
+Eigen::Matrix3d eulerToMatrix(const Vector3d& deg)
+{
+  return (Eigen::AngleAxisd(deg[2] * kDegToRad, Vector3d::UnitZ()) *
+          Eigen::AngleAxisd(deg[1] * kDegToRad, Vector3d::UnitY()) *
+          Eigen::AngleAxisd(deg[0] * kDegToRad, Vector3d::UnitX()))
+    .toRotationMatrix();
+}
+
+Vector3d matrixToEuler(const Eigen::Matrix3d& m)
+{
+  const double sy = std::clamp(-m(2, 0), -1.0, 1.0);
+  const double y = std::asin(sy);
+  double x, z;
+  if (std::cos(y) > 1e-9) {
+    x = std::atan2(m(2, 1), m(2, 2));
+    z = std::atan2(m(1, 0), m(0, 0));
+  } else {
+    // Gimbal lock: put the whole rotation about Z.
+    x = 0.0;
+    z = std::atan2(-m(0, 1), m(1, 1));
+  }
+  return Vector3d(x, y, z) / kDegToRad;
 }
 
 }  // namespace
@@ -63,16 +191,12 @@ std::vector<TextEdit> planTranslate(const ModuleInstantiation& inst, const Vecto
   std::vector<TextEdit> edits;
   if (delta.cwiseAbs().maxCoeff() < kEpsilon) return edits;
 
-  const Vector *vec = inst.name() == "translate" ? translateVector(inst) : nullptr;
+  const auto *vec = inst.name() == "translate" ? dynamic_cast<const Vector *>(argument(inst, "v", 0)) : nullptr;
   const auto children = vec ? vec->getChildren() : std::vector<std::shared_ptr<Expression>>{};
-  const bool editable = vec && (children.size() == 2 || children.size() == 3) &&
-                        !vec->location().isNone();
+  const bool editable = vec && (children.size() == 2 || children.size() == 3);
 
   if (!editable) {
-    const Location& loc = inst.location();
-    edits.push_back(insertAt(loc.firstLine(), loc.firstColumn(),
-                             "translate([" + formatNumber(delta[0]) + ", " + formatNumber(delta[1]) +
-                               ", " + formatNumber(delta[2]) + "]) "));
+    edits.push_back(prefixStatement(inst, "translate(" + vectorText(delta) + ") "));
     return edits;
   }
 
@@ -88,9 +212,8 @@ std::vector<TextEdit> planTranslate(const ModuleInstantiation& inst, const Vecto
     }
 
     const auto& child = children[axis];
-    const auto *literal = dynamic_cast<const Literal *>(child.get());
-    if (literal && literal->isDouble()) {
-      edits.push_back(replaceAt(child->location(), formatNumber(literal->toDouble() + d)));
+    if (const auto value = literalNumber(child.get())) {
+      edits.push_back(replaceAt(child->location(), formatNumber(*value + d)));
     } else {
       // Keep the expression (e.g. a variable) and offset it.
       const Location& loc = child->location();
@@ -98,6 +221,69 @@ std::vector<TextEdit> planTranslate(const ModuleInstantiation& inst, const Vecto
     }
   }
   return edits;
+}
+
+std::vector<TextEdit> planRotate(const ModuleInstantiation& inst, const Vector3d& pivot,
+                                 const Vector3d& axis, double angleDeg)
+{
+  if (std::fabs(angleDeg) < kEpsilon || axis.norm() < kEpsilon) return {};
+  const Eigen::Matrix3d delta =
+    Eigen::AngleAxisd(angleDeg * kDegToRad, axis.normalized()).toRotationMatrix();
+
+  if (const auto sandwich = matchSandwich(inst, "rotate")) {
+    const Vector3d angles = matrixToEuler(delta * eulerToMatrix(sandwich->value));
+    return replaceVector(sandwich->valueExpr, angles);
+  }
+  return {prefixStatement(inst, sandwichText(pivot, "rotate", matrixToEuler(delta)))};
+}
+
+std::vector<TextEdit> planScale(const ModuleInstantiation& inst, const Vector3d& anchor,
+                                const Vector3d& factors)
+{
+  if ((factors - Vector3d::Ones()).cwiseAbs().maxCoeff() < kEpsilon) return {};
+  if (factors.minCoeff() <= 0.0) return {};
+
+  if (const auto sandwich = matchSandwich(inst, "scale")) {
+    return replaceVector(sandwich->valueExpr, sandwich->value.cwiseProduct(factors));
+  }
+
+  // A primitive whose corner sits on the anchor can simply change size.
+  const ModuleInstantiation *primitive = &inst;
+  Vector3d origin = Vector3d::Zero();
+  if (inst.name() == "translate") {
+    const auto offset = literalVector(argument(inst, "v", 0));
+    primitive = offset ? onlyChild(inst) : nullptr;
+    if (offset) origin = *offset;
+  }
+  // Only the axes that change size need the anchor on the primitive's corner.
+  bool anchored = primitive != nullptr;
+  for (int i = 0; i < 3; ++i) {
+    if (std::fabs(factors[i] - 1.0) > kEpsilon && std::fabs(anchor[i] - origin[i]) > kPositionTolerance) {
+      anchored = false;
+    }
+  }
+  if (anchored) {
+    if (primitive->name() == "cube" && notCentered(*primitive, 1)) {
+      const Expression *size = argument(*primitive, "size", 0);
+      if (const auto edge = literalNumber(size)) {
+        const Vector3d scaled = *edge * factors;
+        const bool uniform = (scaled - Vector3d::Constant(scaled[0])).cwiseAbs().maxCoeff() < kEpsilon;
+        return {replaceAt(size->location(), uniform ? formatNumber(scaled[0]) : vectorText(scaled))};
+      }
+      if (const auto dims = literalVector(size, true)) {
+        return replaceVector(size, dims->cwiseProduct(factors));
+      }
+    }
+    const bool onlyZ = std::fabs(factors[0] - 1.0) < kEpsilon && std::fabs(factors[1] - 1.0) < kEpsilon;
+    if (primitive->name() == "cylinder" && onlyZ && notCentered(*primitive, 3)) {
+      const Expression *height = argument(*primitive, "h", 0);
+      if (const auto h = literalNumber(height)) {
+        return {replaceAt(height->location(), formatNumber(*h * factors[2]))};
+      }
+    }
+  }
+
+  return {prefixStatement(inst, sandwichText(anchor, "scale", factors))};
 }
 
 }  // namespace VisualEdit

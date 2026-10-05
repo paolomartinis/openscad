@@ -427,7 +427,7 @@ public slots:
   void editorContentChanged();
   void leftClick(QPoint coordinate);
   void rightClick(QPoint coordinate);
-  void onGizmoDragFinished(double dx, double dy, double dz);
+  void onGizmoCommitted(int handle, double a, double b, double c);
   void dragEnterEvent(QDragEnterEvent *event) override;
   void dropEvent(QDropEvent *event) override;
   void on_helpActionAbout_triggered();

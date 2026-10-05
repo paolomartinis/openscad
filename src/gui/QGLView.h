@@ -55,6 +55,8 @@ public:
   int measure_state;
 
   int pickObject(QPoint position);
+  // Drop the edit in progress (also used when the source could not be changed).
+  void gizmoCancel();
 
   // Leaf node indices of the current visual-editor selection; pressing on
   // one of them starts a drag on the XY plane.
@@ -107,16 +109,34 @@ private:
   void initializeGL() override;
   void resizeGL(int w, int h) override;
 
-  // Move gizmo interaction (see GLView::MoveGizmo).
+  // Transform gizmo interaction (see GLView::TransformGizmo).
   QPointF projectToScreen(const Vector3d& p) const;
   void screenRay(const QPointF& pos, Vector3d& nearPt, Vector3d& farPt) const;
   bool rayHitsPlaneZ(const QPointF& pos, double z, Vector3d& hit) const;
-  int gizmoHitAxis(const QPointF& pos) const;
+  bool axisFacesViewer(int axis) const;
+  int gizmoHitHandle(const QPointF& pos) const;
   bool gizmoStartDrag(const QPointF& pos);
+  void gizmoBeginEdit(int handle, const QPointF& pos);
   void gizmoUpdateDrag(const QPointF& pos);
+  void gizmoApplyInput();
+  void gizmoCommit();
+  void drawGizmoReadout();
+  bool gizmo_dragging = false;           // mouse button held on a handle
+  bool gizmo_input = false;              // value typed on the keyboard
+  QString gizmo_input_text[2];           // [0] = value or X, [1] = Y (plane move)
+  int gizmo_input_field = 0;
   QPointF gizmo_press_pos;
+  QPointF gizmo_last_pos;
   Vector3d gizmo_plane_start;
   double gizmo_plane_z = 0.0;
+  double gizmo_rot_last = 0.0;           // screen angle at the last mouse move
+  double gizmo_rot_accum = 0.0;          // unwrapped screen angle since press
+
+protected:
+  void keyPressEvent(QKeyEvent *event) override;
+  bool focusNextPrevChild(bool next) override;
+
+private:
 
   void paintGL() override;
   void normalizeAngle(GLdouble& angle);
@@ -133,8 +153,11 @@ signals:
   void resized();
   void doRightClick(QPoint screen_coordinate);
   void doLeftClick(QPoint screen_coordinate);
-  // Gizmo drag released with a non-zero offset (world coordinates, mm).
-  void gizmoDragFinished(double dx, double dy, double dz);
+  // A gizmo edit was confirmed (mouse release or Enter). For move handles
+  // (a, b, c) is the world offset in mm, for rotate handles a is the angle in
+  // degrees about the handle axis, for size handles (a, b, c) are the scale
+  // factors along the world axes (min corner of the bounding box fixed).
+  void gizmoCommitted(int handle, double a, double b, double c);
   void initialized();
 };
 
