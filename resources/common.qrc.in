@@ -7,6 +7,8 @@
 
     <file>sounds/complete.wav</file>
 
+    <file>hardware/hardware.scad</file>
+
     <file>icons/prefs3DPrint.png</file>
     <file>icons/prefsInput.png</file>
     <file>icons/prefsInputAxis.png</file>

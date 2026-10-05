@@ -472,6 +472,8 @@ private:
   void visualSelectNode(const std::shared_ptr<const AbstractNode>& node);
   void refreshVisualSelection();
   void clearVisualSelection();
+  void addHardwareMenu();
+  void insertHardware(const QString& module, const QString& size, int lengthKind, bool thread);
 
   char const *afterCompileSlot;
   bool procevents{false};

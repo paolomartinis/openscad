@@ -459,9 +459,13 @@ void QGLView::mouseMoveEvent(QMouseEvent *event)
 
 void QGLView::mouseReleaseEvent(QMouseEvent *event)
 {
+  if (gizmo_swallow_release) {
+    gizmo_swallow_release = false;
+    return;
+  }
   if (gizmo_dragging) {
     gizmo_dragging = false;
-    if (gizmo_input) return;  // wait for Enter / Esc
+    if (gizmo_input) return;  // values are being typed: wait for Enter / Esc
     if (gizmo.hasEdit()) {
       gizmoCommit();
     } else {
@@ -804,8 +808,6 @@ void QGLView::gizmoBeginEdit(int handle, const QPointF& pos)
   gizmo.active = handle;
   gizmo.resetEdit();
   gizmo_input = false;
-  gizmo_input_text[0].clear();
-  gizmo_input_text[1].clear();
   gizmo_input_field = 0;
   gizmo_press_pos = pos;
   gizmo_last_pos = pos;
@@ -890,6 +892,35 @@ void QGLView::gizmoUpdateDrag(const QPointF& pos)
   update();
 }
 
+int QGLView::gizmoInputFieldCount() const
+{
+  return gizmo.active == TransformGizmo::MovePlane ? 3 : 1;
+}
+
+// Tab: switch from the mouse to typed values, prefilled with the current ones.
+void QGLView::gizmoStartInput()
+{
+  using G = TransformGizmo;
+  const int axis = G::axisOf(gizmo.active);
+  double values[3] = {0.0, 0.0, 0.0};
+  if (gizmo.active == G::MovePlane) {
+    for (int i = 0; i < 3; ++i) values[i] = gizmo.offset[i];
+  } else if (G::isMove(gizmo.active)) {
+    values[0] = gizmo.offset[axis];
+  } else if (G::isRotate(gizmo.active)) {
+    values[0] = gizmo.angle;
+  } else if (G::isSize(gizmo.active)) {
+    values[0] = gizmo.size[axis];
+  }
+  for (int i = 0; i < 3; ++i) {
+    gizmo_input_text[i] = formatValue(values[i], 2);
+    gizmo_input_fresh[i] = true;
+  }
+  gizmo_input = true;
+  gizmo_input_field = 0;
+  update();
+}
+
 // Typed values replace the mouse values of the edit in progress.
 void QGLView::gizmoApplyInput()
 {
@@ -908,8 +939,7 @@ void QGLView::gizmoApplyInput()
 
   if (gizmo.active == G::MovePlane) {
     bool unused = false;
-    const auto v1 = parse(gizmo_input_text[1], &unused);
-    gizmo.offset = Vector3d(v0.value_or(0.0), v1.value_or(0.0), 0.0);
+    for (int i = 0; i < 3; ++i) gizmo.offset[i] = parse(gizmo_input_text[i], &unused).value_or(0.0);
   } else if (G::isMove(gizmo.active)) {
     gizmo.offset = Vector3d::Zero();
     gizmo.offset[axis] = v0.value_or(0.0);
@@ -963,62 +993,62 @@ void QGLView::gizmoCancel()
 void QGLView::keyPressEvent(QKeyEvent *event)
 {
   using G = TransformGizmo;
-  const QString text = event->text();
-  const bool valueChar = !text.isEmpty() && QString("0123456789.,-%").contains(text[0]);
+  const int key = event->key();
+  const bool tab = key == Qt::Key_Tab || key == Qt::Key_Backtab;
 
-  // Typing while hovering a handle starts an edit on it.
-  if (gizmo.active == G::None && gizmo.visible && gizmo.hover != G::None && valueChar) {
-    gizmoBeginEdit(gizmo.hover, gizmo_last_pos.isNull() ? QPointF(width() / 2.0, height() / 2.0)
-                                                         : gizmo_last_pos);
-    if (gizmo.active == G::MovePlane) gizmo_plane_z = gizmo.bbox.min().z();
+  // Like AutoCAD dynamic input, Tab switches to typed values: on the edit
+  // being dragged, on the hovered handle, or else a free X/Y/Z move.
+  if (tab && gizmo.active == G::None && gizmo.visible) {
+    const int handle = gizmo.hover != G::None ? gizmo.hover : G::MovePlane;
+    gizmoBeginEdit(handle, gizmo_last_pos.isNull() ? QPointF(width() / 2.0, height() / 2.0) : gizmo_last_pos);
   }
   if (gizmo.active == G::None) {
     QOpenGLWidget::keyPressEvent(event);
     return;
   }
 
-  switch (event->key()) {
-  case Qt::Key_Escape: gizmoCancel(); break;
-  case Qt::Key_Return:
-  case Qt::Key_Enter:
-    if (gizmo_input) gizmoApplyInput();
-    if (!gizmo_dragging) gizmoCommit();
-    break;
-  case Qt::Key_Tab:
-  case Qt::Key_Backtab:
-    if (gizmo.active == G::MovePlane) {
-      gizmo_input = true;
-      gizmo_input_field ^= 1;
+  const QString text = event->text();
+  const bool valueChar = !text.isEmpty() && QString("0123456789.,-%").contains(text[0]);
+  QString& field = gizmo_input_text[gizmo_input_field];
+  bool& fresh = gizmo_input_fresh[gizmo_input_field];
+
+  if (tab) {
+    if (!gizmo_input) {
+      gizmoStartInput();
+    } else {
+      const int n = gizmoInputFieldCount();
+      gizmo_input_field = (gizmo_input_field + (key == Qt::Key_Backtab ? n - 1 : 1)) % n;
+      gizmo_input_fresh[gizmo_input_field] = true;
       update();
     }
-    break;
-  case Qt::Key_Backspace:
-    if (gizmo_input) {
-      gizmo_input_text[gizmo_input_field].chop(1);
-      gizmoApplyInput();
-    }
-    break;
-  default:
-    if (!valueChar) {
-      QOpenGLWidget::keyPressEvent(event);
-      return;
-    }
-    if (!gizmo_input) {
-      gizmo_input = true;
-      gizmo_input_text[0].clear();
-      gizmo_input_text[1].clear();
-    }
-    gizmo_input_text[gizmo_input_field] += text;
+  } else if (key == Qt::Key_Escape) {
+    gizmoCancel();
+  } else if (key == Qt::Key_Return || key == Qt::Key_Enter) {
+    if (gizmo_input) gizmoApplyInput();
+    // Committing with the button still down: its release is not a click.
+    if (gizmo_dragging) gizmo_swallow_release = true;
+    gizmoCommit();
+  } else if (gizmo_input && key == Qt::Key_Backspace) {
+    if (fresh) field.clear();
+    else field.chop(1);
+    fresh = false;
     gizmoApplyInput();
-    break;
+  } else if (gizmo_input && valueChar) {
+    if (fresh) field.clear();
+    fresh = false;
+    field += text;
+    gizmoApplyInput();
+  } else {
+    QOpenGLWidget::keyPressEvent(event);
+    return;
   }
   event->accept();
 }
 
 bool QGLView::focusNextPrevChild(bool next)
 {
-  // Tab switches the X/Y field of a typed plane move.
-  if (gizmo.active != TransformGizmo::None) return false;
+  // Tab opens / cycles the typed gizmo values instead of moving the focus.
+  if (gizmo.active != TransformGizmo::None || gizmo.visible) return false;
   return QOpenGLWidget::focusNextPrevChild(next);
 }
 
@@ -1038,12 +1068,14 @@ void QGLView::drawGizmoReadout()
   std::vector<Field> fields;
   auto typed = [this](int field, const QString& value) {
     if (!gizmo_input) return value;
-    return gizmo_input_text[field] + (gizmo_input_field == field ? "|" : "");
+    const bool current = gizmo_input_field == field;
+    return gizmo_input_text[field] + (current && !gizmo_input_fresh[field] ? "|" : "");
   };
   if (gizmo.active == G::MovePlane) {
     title = "Move";
     fields.push_back({"X", typed(0, formatValue(gizmo.offset.x(), 2)), "mm"});
     fields.push_back({"Y", typed(1, formatValue(gizmo.offset.y(), 2)), "mm"});
+    if (gizmo_input) fields.push_back({"Z", typed(2, formatValue(gizmo.offset.z(), 2)), "mm"});
   } else if (G::isMove(gizmo.active)) {
     title = "Move";
     fields.push_back({axisNames[axis], typed(0, formatValue(gizmo.offset[axis], 2)), "mm"});
@@ -1056,8 +1088,9 @@ void QGLView::drawGizmoReadout()
     fields.push_back({axisNames[axis], typed(0, formatValue(gizmo.size[axis], 2)), "mm"});
     if (old > 0) title += QString("  (%1%)").arg(formatValue(gizmo.size[axis] / old * 100.0, 1));
   }
-  const QString hint = gizmo.active == G::MovePlane ? "type values - Tab: next - Enter: apply - Esc: cancel"
-                                                    : "type a value - Enter: apply - Esc: cancel";
+  const QString hint = !gizmo_input              ? "Tab: type a value - Esc: cancel"
+                     : gizmoInputFieldCount() > 1 ? "Tab: next field - Enter: apply - Esc: cancel"
+                                                  : "Enter: apply - Esc: cancel";
 
   QPainter painter(this);
   painter.setRenderHint(QPainter::Antialiasing);

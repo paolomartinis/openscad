@@ -122,9 +122,13 @@ private:
   void gizmoCommit();
   void drawGizmoReadout();
   bool gizmo_dragging = false;           // mouse button held on a handle
-  bool gizmo_input = false;              // value typed on the keyboard
-  QString gizmo_input_text[2];           // [0] = value or X, [1] = Y (plane move)
+  bool gizmo_input = false;              // values typed on the keyboard (opened with Tab)
+  QString gizmo_input_text[3];           // one field, or X/Y/Z for a free move
+  bool gizmo_input_fresh[3] = {};        // prefilled: the next key replaces the text
   int gizmo_input_field = 0;
+  bool gizmo_swallow_release = false;    // committed with Enter while the button was held
+  int gizmoInputFieldCount() const;
+  void gizmoStartInput();
   QPointF gizmo_press_pos;
   QPointF gizmo_last_pos;
   Vector3d gizmo_plane_start;

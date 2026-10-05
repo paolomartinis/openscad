@@ -142,6 +142,8 @@
 #include "gui/QWordSearchField.h"
 #include "gui/ScintillaEditor.h"
 #include "gui/VisualEdit.h"
+#include <QInputDialog>
+#include <QRegularExpression>
 #include "core/TransformNode.h"
 #include "gui/SettingsWriter.h"
 #include "gui/TabManager.h"
@@ -2347,7 +2349,7 @@ void MainWindow::visualSelectNode(const std::shared_ptr<const AbstractNode>& nod
   std::vector<std::shared_ptr<const AbstractNode>> sameStatement;
   this->rootNode->findNodesWithSameMod(node, sameStatement);
   QString message = QString("Selected %1 (line %2): drag arrows/object to move, rings to rotate, "
-                            "white squares to resize; type a value while dragging; click again to go inside")
+                            "white squares to resize; Tab to type exact values; click again to go inside")
                       .arg(QString::fromStdString(node->modinst->name()))
                       .arg(loc.firstLine());
   if (sameStatement.size() > 1) {
@@ -2462,6 +2464,157 @@ void MainWindow::onGizmoCommitted(int handle, double a, double b, double c)
   this->statusBar()->showMessage(done + " - Ctrl+Z to undo");
 
   // The gizmo keeps showing the ghost until the new preview arrives.
+  actionRenderPreview();
+}
+
+// ── Insert > Hardware ───────────────────────────────────────────────────────
+
+namespace {
+
+enum HardwareLength { NoLength, ScrewLength, SetScrewLength, RodLength, HoleDepth };
+
+struct HardwarePart {
+  const char *category;
+  const char *label;
+  const char *module;
+  HardwareLength length;
+  bool thread;
+};
+
+const HardwarePart hardwareParts[] = {
+  {"Screws", "Hex bolt (ISO 4017)", "hex_bolt", ScrewLength, false},
+  {"Screws", "Socket head (ISO 4762)", "socket_head_screw", ScrewLength, false},
+  {"Screws", "Countersunk (ISO 10642)", "countersunk_screw", ScrewLength, false},
+  {"Screws", "Button head (ISO 7380)", "button_head_screw", ScrewLength, false},
+  {"Screws", "Set screw / grub (ISO 4026)", "set_screw", SetScrewLength, false},
+  {"Screws", "Threaded rod", "threaded_rod", RodLength, false},
+  {"Screws with printable thread", "Hex bolt (ISO 4017)", "hex_bolt", ScrewLength, true},
+  {"Screws with printable thread", "Socket head (ISO 4762)", "socket_head_screw", ScrewLength, true},
+  {"Screws with printable thread", "Countersunk (ISO 10642)", "countersunk_screw", ScrewLength, true},
+  {"Screws with printable thread", "Button head (ISO 7380)", "button_head_screw", ScrewLength, true},
+  {"Screws with printable thread", "Set screw / grub (ISO 4026)", "set_screw", SetScrewLength, true},
+  {"Screws with printable thread", "Threaded rod", "threaded_rod", RodLength, true},
+  {"Nuts && Washers", "Hex nut (ISO 4032)", "hex_nut", NoLength, false},
+  {"Nuts && Washers", "Nyloc nut (ISO 10511)", "nyloc_nut", NoLength, false},
+  {"Nuts && Washers", "Washer (ISO 7089)", "washer", NoLength, false},
+  {"Holes (cutting tools)", "Clearance hole", "clearance_hole", HoleDepth, false},
+  {"Holes (cutting tools)", "Counterbore (socket head)", "counterbore_hole", HoleDepth, false},
+  {"Holes (cutting tools)", "Countersink", "countersink_hole", HoleDepth, false},
+  {"Holes (cutting tools)", "Nut trap", "nut_trap", HoleDepth, false},
+  {"Holes (cutting tools)", "Heat-set insert", "heat_insert_hole", NoLength, false},
+  {"Holes (cutting tools)", "Tapped hole (printable thread)", "tapped_hole", HoleDepth, false},
+};
+
+const char *const hardwareSizes[] = {"M2", "M2.5", "M3", "M4", "M5", "M6", "M8", "M10", "M12"};
+
+// Suggested screw lengths per size.
+double defaultScrewLength(const QString& size)
+{
+  static const QHash<QString, double> lengths = {{"M2", 8},  {"M2.5", 10}, {"M3", 10},
+                                                 {"M4", 12}, {"M5", 16},   {"M6", 20},
+                                                 {"M8", 25}, {"M10", 30},  {"M12", 40}};
+  return lengths.value(size, 10);
+}
+
+const char *const hardwareLibrary = "openscad-hardware/hardware.scad";
+
+// Copies the bundled library into the user library folder when it is
+// missing or outdated, so `use <openscad-hardware/hardware.scad>` resolves.
+bool installHardwareLibrary(QString *error)
+{
+  QFile bundled(":/hardware/hardware.scad");
+  if (!bundled.open(QIODevice::ReadOnly)) {
+    *error = "The hardware library is missing from this build";
+    return false;
+  }
+  const QByteArray content = bundled.readAll();
+  const QString path =
+    QDir(QString::fromStdString(PlatformUtils::userLibraryPath())).filePath(hardwareLibrary);
+  QFile installed(path);
+  if (installed.open(QIODevice::ReadOnly) && installed.readAll() == content) return true;
+  installed.close();
+  if (!QDir().mkpath(QFileInfo(path).absolutePath()) || !installed.open(QIODevice::WriteOnly) ||
+      installed.write(content) != content.size()) {
+    *error = QString("Cannot write %1").arg(QDir::toNativeSeparators(path));
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+void MainWindow::addHardwareMenu()
+{
+  auto *insertMenu = new QMenu("&Insert", this);
+  this->menuBar()->insertMenu(this->menu_View->menuAction(), insertMenu);
+  QMenu *hardwareMenu = insertMenu->addMenu("&Hardware");
+
+  QHash<QString, QMenu *> categories;
+  for (const auto& part : hardwareParts) {
+    QMenu *&category = categories[part.category];
+    if (!category) category = hardwareMenu->addMenu(part.category);
+    QMenu *partMenu = category->addMenu(part.label);
+    for (const char *size : hardwareSizes) {
+      connect(partMenu->addAction(size), &QAction::triggered, this, [this, part, size]() {
+        insertHardware(part.module, size, part.length, part.thread);
+      });
+    }
+  }
+}
+
+void MainWindow::insertHardware(const QString& module, const QString& size, int lengthKind, bool thread)
+{
+  auto *editor = dynamic_cast<ScintillaEditor *>(activeEditor);
+  if (!editor) return;
+
+  QString error;
+  if (!installHardwareLibrary(&error)) {
+    QMessageBox::warning(this, "Insert hardware", error);
+    return;
+  }
+
+  QStringList args{QString("\"%1\"").arg(size)};
+  if (lengthKind != NoLength) {
+    double suggested = lengthKind == HoleDepth ? 10.0 : defaultScrewLength(size);
+    if (lengthKind == RodLength) suggested *= 2;
+    if (lengthKind == SetScrewLength) suggested = std::max(3.0, std::round(suggested / 2));
+    bool ok = false;
+    const double length = QInputDialog::getDouble(
+      this, QString("%1 %2").arg(module, size), lengthKind == HoleDepth ? "Hole depth (mm):" : "Length (mm):",
+      suggested, 0.5, 1000.0, 1, &ok);
+    if (!ok) return;
+    args << QString("l = %1").arg(QString::fromStdString(VisualEdit::formatNumber(length)));
+  }
+  if (thread) args << "thread = true";
+  const QString call = QString("%1(%2);").arg(module, args.join(", "));
+
+  QsciScintilla *qsci = editor->qsci;
+  const QString text = editor->toPlainText();
+  qsci->beginUndoAction();
+  // The call goes at the end of the file, the library import at the top.
+  QString tail = text.isEmpty() || text.endsWith('\n') ? "" : "\n";
+  tail += call + "\n";
+  qsci->SendScintilla(QsciScintillaBase::SCI_APPENDTEXT, tail.toUtf8().size(), tail.toUtf8().constData());
+  const QRegularExpression imported(
+    QString("^\\s*(use|include)\\s*<\\s*%1\\s*>").arg(QRegularExpression::escape(hardwareLibrary)),
+    QRegularExpression::MultilineOption);
+  bool addedImport = false;
+  if (!imported.match(text).hasMatch()) {
+    const QByteArray line = QString("use <%1>\n").arg(hardwareLibrary).toUtf8();
+    qsci->insertAt(QString::fromUtf8(line), 0, 0);
+    addedImport = true;
+  }
+  qsci->endUndoAction();
+
+  // Select the new part once it is rendered, so it can be moved right away.
+  const int lines = static_cast<int>(qsci->SendScintilla(QsciScintillaBase::SCI_GETLINECOUNT));
+  visualSelection = {0, lines - 1, 1};  // the call is on the last non-empty line
+  QString message = QString("Inserted %1").arg(call);
+  if (module.endsWith("_hole") || module == "nut_trap") {
+    message += " - holes are cutting tools: put them inside a difference()";
+  }
+  if (addedImport) message += QString(" (added use <%1>)").arg(hardwareLibrary);
+  this->statusBar()->showMessage(message);
   actionRenderPreview();
 }
 
@@ -4002,6 +4155,7 @@ void MainWindow::setup3DView()
   connect(this->qglview, &QGLView::doRightClick, this, &MainWindow::rightClick);
   connect(this->qglview, &QGLView::doLeftClick, this, &MainWindow::leftClick);
   connect(this->qglview, &QGLView::gizmoCommitted, this, &MainWindow::onGizmoCommitted);
+  addHardwareMenu();
   connect(this->qglview, &QGLView::initialized, this, &MainWindow::updateViewModeAfterGLInit);
 }
 
