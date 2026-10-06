@@ -121,6 +121,16 @@ public:
     [[nodiscard]] Vector3d transformPoint(const Vector3d& p) const;
   };
   TransformGizmo gizmo;
+
+  // Where a part will be placed (Insert > Hardware): a ring on the face under
+  // the mouse and its normal.
+  struct PlacementMarker {
+    bool visible = false;
+    Vector3d point = Vector3d::Zero();
+    Vector3d normal = Vector3d::UnitZ();
+    double radius = 3.0;
+  };
+  PlacementMarker placement;
   [[nodiscard]] Vector3d gizmoOrigin() const { return gizmo.bbox.center(); }
   [[nodiscard]] double gizmoHandleLength() const { return cam.zoomValue() * 0.12; }
   [[nodiscard]] double gizmoRingRadius() const { return gizmoHandleLength() * 0.8; }
@@ -134,6 +144,7 @@ public:
 #endif
   void showObject(const SelectedObject& pt, const Vector3d& eyedir);
   void showGizmo();
+  void showPlacement();
 
 private:
   void showCrosshairs(const Color4f& col);

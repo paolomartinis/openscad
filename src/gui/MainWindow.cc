@@ -143,6 +143,7 @@
 #include "gui/ScintillaEditor.h"
 #include "gui/VisualEdit.h"
 #include <QInputDialog>
+#include <QColorDialog>
 #include <QRegularExpression>
 #include "core/TransformNode.h"
 #include "gui/SettingsWriter.h"
@@ -2548,6 +2549,8 @@ void MainWindow::addHardwareMenu()
   auto *insertMenu = new QMenu("&Insert", this);
   this->menuBar()->insertMenu(this->menu_View->menuAction(), insertMenu);
   QMenu *hardwareMenu = insertMenu->addMenu("&Hardware");
+  insertMenu->addSeparator();
+  insertMenu->addAction("&Color selection...  (C in the 3D view)", this, &MainWindow::colorSelection);
 
   QHash<QString, QMenu *> categories;
   for (const auto& part : hardwareParts) {
@@ -2586,35 +2589,162 @@ void MainWindow::insertHardware(const QString& module, const QString& size, int 
     args << QString("l = %1").arg(QString::fromStdString(VisualEdit::formatNumber(length)));
   }
   if (thread) args << "thread = true";
-  const QString call = QString("%1(%2);").arg(module, args.join(", "));
 
+  pendingPart.call = QString("%1(%2)").arg(module, args.join(", "));
+  pendingPart.hole = module.endsWith("_hole") || module == "nut_trap";
+  const double markerRadius = std::max(2.0, size.mid(1).toDouble());
+  this->qglview->startPlacement(QString("%1  %2").arg(module, size), markerRadius);
+  this->statusBar()->showMessage(
+    pendingPart.hole ? "Click the face to drill: the hole is cut from that object (Esc: cancel)"
+                     : "Click a face to place the part, or the ground (Esc: cancel)");
+}
+
+// Replaces the editor text with `newText` as one undo step, touching only the
+// part that differs.
+void MainWindow::replaceSourceText(const std::string& newText)
+{
+  auto *editor = dynamic_cast<ScintillaEditor *>(activeEditor);
+  if (!editor) return;
   QsciScintilla *qsci = editor->qsci;
-  const QString text = editor->toPlainText();
+  const std::string oldText = qsci->text().toUtf8().toStdString();
+  size_t prefix = 0;
+  while (prefix < oldText.size() && prefix < newText.size() && oldText[prefix] == newText[prefix]) ++prefix;
+  size_t suffix = 0;
+  while (suffix < oldText.size() - prefix && suffix < newText.size() - prefix &&
+         oldText[oldText.size() - 1 - suffix] == newText[newText.size() - 1 - suffix]) {
+    ++suffix;
+  }
+  const std::string middle = newText.substr(prefix, newText.size() - prefix - suffix);
   qsci->beginUndoAction();
-  // The call goes at the end of the file, the library import at the top.
-  QString tail = text.isEmpty() || text.endsWith('\n') ? "" : "\n";
-  tail += call + "\n";
-  qsci->SendScintilla(QsciScintillaBase::SCI_APPENDTEXT, tail.toUtf8().size(), tail.toUtf8().constData());
+  qsci->SendScintilla(QsciScintillaBase::SCI_SETTARGETSTART, static_cast<long>(prefix));
+  qsci->SendScintilla(QsciScintillaBase::SCI_SETTARGETEND, static_cast<long>(oldText.size() - suffix));
+  qsci->SendScintilla(QsciScintillaBase::SCI_REPLACETARGET, middle.size(), middle.c_str());
+  qsci->endUndoAction();
+}
+
+bool MainWindow::applySourceEdits(const std::vector<VisualEdit::TextEdit>& edits)
+{
+  auto *editor = dynamic_cast<ScintillaEditor *>(renderedEditor);
+  if (!editor || edits.empty()) return false;
+  QsciScintilla *qsci = editor->qsci;
+  auto position = [qsci](int line, int column) {
+    return qsci->SendScintilla(QsciScintillaBase::SCI_POSITIONFROMLINE, line - 1) + column - 1;
+  };
+  qsci->beginUndoAction();
+  for (auto it = edits.rbegin(); it != edits.rend(); ++it) {
+    qsci->SendScintilla(QsciScintillaBase::SCI_SETTARGETSTART, position(it->firstLine, it->firstColumn));
+    qsci->SendScintilla(QsciScintillaBase::SCI_SETTARGETEND, position(it->lastLine, it->lastColumn));
+    qsci->SendScintilla(QsciScintillaBase::SCI_REPLACETARGET, it->text.size(), it->text.c_str());
+  }
+  qsci->endUndoAction();
+  return true;
+}
+
+void MainWindow::onPlacementChosen(bool onSurface, double px, double py, double pz, double nx, double ny,
+                                   double nz, QPoint position)
+{
+  auto *editor = dynamic_cast<ScintillaEditor *>(activeEditor);
+  if (!editor || pendingPart.call.isEmpty()) {
+    this->qglview->stopPlacement();
+    return;
+  }
+  const std::string oldText = editor->qsci->text().toUtf8().toStdString();
+  const std::string eol = oldText.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+  // Holes are shown with '#' (highlight) so they stay visible and selectable.
+  const std::string statement = (pendingPart.hole ? "#" : "") +
+                                VisualEdit::placementPrefix(Vector3d(px, py, pz), Vector3d(nx, ny, nz)) +
+                                pendingPart.call.toStdString();
+
+  // Byte offset of a 1-based line/column of the compiled text.
+  auto offsetOf = [&oldText](int line, int column) {
+    size_t offset = 0;
+    for (int l = 1; l < line && offset != std::string::npos; ++l) {
+      offset = oldText.find('\n', offset);
+      if (offset != std::string::npos) ++offset;
+    }
+    return offset == std::string::npos ? std::string::npos : offset + column - 1;
+  };
+
+  std::string newText;
+  size_t statementOffset = std::string::npos;
+  QString message;
+  if (pendingPart.hole && onSurface && this->rootNode && editor->toPlainText() == lastCompiledDoc) {
+    // Cut the hole from the outermost statement of the clicked object.
+    std::deque<std::shared_ptr<const AbstractNode>> path;
+    const int index = this->qglview->pickObject(position);
+    const auto picked = index >= 0 ? this->rootNode->getNodeByID(index, path) : nullptr;
+    const auto chain = picked ? visualSelectionChain(path) : decltype(visualSelectionChain(path)){};
+    if (!chain.empty()) {
+      const ModuleInstantiation& target = *chain.front()->modinst;
+      const Location& loc = target.location();
+      newText = VisualEdit::addCut(oldText, offsetOf(loc.firstLine(), loc.firstColumn()),
+                                   offsetOf(loc.lastLine(), loc.lastColumn()), target.name() == "difference",
+                                   statement, &statementOffset);
+      if (!newText.empty()) {
+        message = QString("Hole cut from %1 (line %2)").arg(QString::fromStdString(target.name())).arg(loc.firstLine());
+      }
+    }
+  }
+  if (newText.empty()) {
+    // Not a hole (or nothing to cut): add the part at the end of the file.
+    newText = oldText;
+    if (!newText.empty() && newText.back() != '\n') newText += eol;
+    statementOffset = newText.size();
+    newText += statement + ";" + eol;
+    message = pendingPart.hole && onSurface
+                ? "The code changed since the last preview: hole added at the end, put it in a difference()"
+                : QString("Placed %1").arg(pendingPart.call);
+  }
+
+  // Library import at the top when missing.
   const QRegularExpression imported(
     QString("^\\s*(use|include)\\s*<\\s*%1\\s*>").arg(QRegularExpression::escape(hardwareLibrary)),
     QRegularExpression::MultilineOption);
-  bool addedImport = false;
-  if (!imported.match(text).hasMatch()) {
-    const QByteArray line = QString("use <%1>\n").arg(hardwareLibrary).toUtf8();
-    qsci->insertAt(QString::fromUtf8(line), 0, 0);
-    addedImport = true;
+  if (!imported.match(QString::fromStdString(oldText)).hasMatch()) {
+    const std::string line = std::string("use <") + hardwareLibrary + ">" + eol;
+    newText = line + newText;
+    statementOffset += line.size();
   }
-  qsci->endUndoAction();
 
-  // Select the new part once it is rendered, so it can be moved right away.
-  const int lines = static_cast<int>(qsci->SendScintilla(QsciScintillaBase::SCI_GETLINECOUNT));
-  visualSelection = {0, lines - 1, 1};  // the call is on the last non-empty line
-  QString message = QString("Inserted %1").arg(call);
-  if (module.endsWith("_hole") || module == "nut_trap") {
-    message += " - holes are cutting tools: put them inside a difference()";
+  replaceSourceText(newText);
+  this->qglview->stopPlacement();
+  pendingPart = {};
+
+  // Select the new part (its translate) once rendered, ready to be moved.
+  const size_t callOffset = statementOffset + (newText.compare(statementOffset, 1, "#") == 0 ? 1 : 0);
+  const size_t lineStart = newText.rfind('\n', callOffset == 0 ? 0 : callOffset - 1);
+  const int line = 1 + static_cast<int>(std::count(newText.begin(), newText.begin() + callOffset, '\n'));
+  const int column = static_cast<int>(callOffset - (lineStart == std::string::npos ? 0 : lineStart + 1)) + 1;
+  visualSelection = {0, line, column};
+  this->statusBar()->showMessage(message + " - Ctrl+Z to undo");
+  actionRenderPreview();
+}
+
+void MainWindow::colorSelection()
+{
+  auto *editor = dynamic_cast<ScintillaEditor *>(renderedEditor);
+  if (!editor || !this->rootNode || visualSelection.nodeIndex < 0) {
+    this->statusBar()->showMessage("Select an object in the 3D view first");
+    return;
   }
-  if (addedImport) message += QString(" (added use <%1>)").arg(hardwareLibrary);
-  this->statusBar()->showMessage(message);
+  if (editor->toPlainText() != lastCompiledDoc) {
+    this->statusBar()->showMessage("The code changed since the last preview: press F5, then try again");
+    return;
+  }
+  std::deque<std::shared_ptr<const AbstractNode>> path;
+  const auto node = this->rootNode->getNodeByID(visualSelection.nodeIndex, path);
+  if (!node || !node->modinst) return;
+
+  const QColor color = QColorDialog::getColor(Qt::white, this, "Color of the selection");
+  if (!color.isValid()) return;
+  const auto edits =
+    VisualEdit::planColor(*node->modinst, Vector3d(color.redF(), color.greenF(), color.blueF()));
+  if (edits.empty()) {
+    this->statusBar()->showMessage("The color of this object is computed in the code: change it there");
+    return;
+  }
+  applySourceEdits(edits);
+  this->statusBar()->showMessage(QString("Color set to %1 - Ctrl+Z to undo").arg(color.name()));
   actionRenderPreview();
 }
 
@@ -4155,6 +4285,10 @@ void MainWindow::setup3DView()
   connect(this->qglview, &QGLView::doRightClick, this, &MainWindow::rightClick);
   connect(this->qglview, &QGLView::doLeftClick, this, &MainWindow::leftClick);
   connect(this->qglview, &QGLView::gizmoCommitted, this, &MainWindow::onGizmoCommitted);
+  connect(this->qglview, &QGLView::placementChosen, this, &MainWindow::onPlacementChosen);
+  connect(this->qglview, &QGLView::placementCancelled, this,
+          [this]() { this->statusBar()->showMessage("Insert cancelled"); });
+  connect(this->qglview, &QGLView::colorRequested, this, &MainWindow::colorSelection);
   addHardwareMenu();
   connect(this->qglview, &QGLView::initialized, this, &MainWindow::updateViewModeAfterGLInit);
 }

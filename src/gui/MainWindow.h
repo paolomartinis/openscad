@@ -72,6 +72,8 @@ class AIDock;
 #include "utils/scope_guard.hpp"
 
 class UXTest;
+#include "gui/VisualEdit.h"
+
 class MainWindow : public QMainWindow, public Ui::MainWindow, public InputEventHandler
 {
   Q_OBJECT
@@ -474,6 +476,16 @@ private:
   void clearVisualSelection();
   void addHardwareMenu();
   void insertHardware(const QString& module, const QString& size, int lengthKind, bool thread);
+  void onPlacementChosen(bool onSurface, double px, double py, double pz, double nx, double ny,
+                         double nz, QPoint position);
+  void colorSelection();
+  bool applySourceEdits(const std::vector<VisualEdit::TextEdit>& edits);
+  void replaceSourceText(const std::string& newText);
+  // Part waiting for a placement click (Insert > Hardware).
+  struct PendingPart {
+    QString call;  // e.g. socket_head_screw("M3", l = 12), without ';'
+    bool hole = false;
+  } pendingPart;
 
   char const *afterCompileSlot;
   bool procevents{false};

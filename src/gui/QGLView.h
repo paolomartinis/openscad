@@ -58,6 +58,11 @@ public:
   // Drop the edit in progress (also used when the source could not be changed).
   void gizmoCancel();
 
+  // Placement mode: the next click on a face (or on the ground) places a part.
+  void startPlacement(const QString& label, double markerRadius);
+  void stopPlacement();
+  bool placementActive() const { return placement_active; }
+
   // Leaf node indices of the current visual-editor selection; pressing on
   // one of them starts a drag on the XY plane.
   std::set<int> gizmoSelectionIndices;
@@ -121,6 +126,12 @@ private:
   void gizmoApplyInput();
   void gizmoCommit();
   void drawGizmoReadout();
+  bool surfaceAt(const QPointF& pos, Vector3d& point, Vector3d& normal);
+  void updatePlacement(const QPointF& pos);
+  void drawPlacementReadout();
+  bool placement_active = false;
+  bool placement_on_surface = false;
+  QString placement_label;
   bool gizmo_dragging = false;           // mouse button held on a handle
   bool gizmo_input = false;              // values typed on the keyboard (opened with Tab)
   QString gizmo_input_text[3];           // one field, or X/Y/Z for a free move
@@ -162,6 +173,12 @@ signals:
   // degrees about the handle axis, for size handles (a, b, c) are the scale
   // factors along the world axes (min corner of the bounding box fixed).
   void gizmoCommitted(int handle, double a, double b, double c);
+  // Placement click: point and outward normal of the face (or the ground).
+  void placementChosen(bool onSurface, double px, double py, double pz, double nx, double ny, double nz,
+                       QPoint position);
+  void placementCancelled();
+  // "C" pressed with a selection.
+  void colorRequested();
   void initialized();
 };
 

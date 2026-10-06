@@ -50,4 +50,33 @@ std::vector<TextEdit> planRotate(const ModuleInstantiation& inst, const Vector3d
 std::vector<TextEdit> planScale(const ModuleInstantiation& inst, const Vector3d& anchor,
                                 const Vector3d& factors);
 
+// Colors the object: an existing literal color() on the statement (or on its
+// chain of single children) gets the new value, otherwise the statement is
+// prefixed with color("#rrggbb"). `rgb` is in 0..1. Returns no edits when
+// the existing color is computed by an expression.
+std::vector<TextEdit> planColor(const ModuleInstantiation& inst, const Vector3d& rgb);
+
+// ---- Placing parts on faces (byte offsets into the source text) ----
+
+// Angles for rotate([x, y, z]) that turn +Z into `normal`.
+Vector3d anglesForNormal(const Vector3d& normal);
+
+// "translate([..]) rotate([..]) " that puts a part's z = 0 plane at `point`
+// with its +Z along `normal`; rotate() is left out when not needed.
+std::string placementPrefix(const Vector3d& point, const Vector3d& normal);
+
+// Offset just past the statement whose module call ends at `argsEnd` (right
+// after its closing parenthesis): past its ';' or the '}' closing its block.
+// Comments and strings are skipped. Returns std::string::npos if unterminated.
+size_t statementEnd(const std::string& text, size_t argsEnd);
+
+// Adds `cut` (one statement, without ';') as a cutting tool of the statement
+// starting at `start` whose module call ends at `argsEnd`: inside its braces
+// when it is a difference() block, otherwise the statement is wrapped in
+// "difference() { ... }". Returns the new text and sets *cutOffset to where
+// `cut` starts in it; returns an empty string when the statement is not
+// terminated.
+std::string addCut(const std::string& text, size_t start, size_t argsEnd, bool isDifference,
+                   const std::string& cut, size_t *cutOffset);
+
 }  // namespace VisualEdit

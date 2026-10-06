@@ -286,6 +286,7 @@ void GLView::paintGL()
   }
   glDisable(GL_LIGHTING);
   if (gizmo.visible) showGizmo();
+  if (placement.visible) showPlacement();
   if (showaxes) GLView::showSmallaxes(axescolor);
 
   // Workaround for inconsistent QT behavior related to handling custom OpenGL widgets that
@@ -692,6 +693,42 @@ void GLView::showGizmo()
     glEnd();
   }
 
+  glPointSize(1.0f);
+  glLineWidth(1.0f);
+  glEnable(GL_DEPTH_TEST);
+}
+
+void GLView::showPlacement()
+{
+  glDisable(GL_DEPTH_TEST);
+  const Vector3d n = placement.normal.normalized();
+  const Vector3d u = n.unitOrthogonal(), v = n.cross(u);
+  const Vector3d& p = placement.point;
+  const double r = placement.radius;
+  glColor4f(0.2f, 0.9f, 1.0f, 1.0f);
+  glLineWidth(2.5f);
+  glBegin(GL_LINE_LOOP);
+  for (int i = 0; i < 48; ++i) {
+    const double a = i * 2.0 * M_PI / 48.0;
+    const Vector3d q = p + r * (std::cos(a) * u + std::sin(a) * v);
+    glVertex3d(q[0], q[1], q[2]);
+  }
+  glEnd();
+  glBegin(GL_LINES);
+  // Normal and a cross in the face plane.
+  const Vector3d tip = p + n * r * 2.0;
+  glVertex3d(p[0], p[1], p[2]);
+  glVertex3d(tip[0], tip[1], tip[2]);
+  for (const Vector3d& d : {u, v}) {
+    const Vector3d a = p - d * r * 0.5, b = p + d * r * 0.5;
+    glVertex3d(a[0], a[1], a[2]);
+    glVertex3d(b[0], b[1], b[2]);
+  }
+  glEnd();
+  glPointSize(8.0f);
+  glBegin(GL_POINTS);
+  glVertex3d(tip[0], tip[1], tip[2]);
+  glEnd();
   glPointSize(1.0f);
   glLineWidth(1.0f);
   glEnable(GL_DEPTH_TEST);

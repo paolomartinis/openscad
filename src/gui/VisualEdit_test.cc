@@ -145,3 +145,101 @@ TEST_CASE("VisualEdit scale", "[visualedit]")
           "translate([-5, -5, -5]) scale([2, 3, 1]) translate([5, 5, 5]) cube(10, center = true);");
   }
 }
+
+TEST_CASE("VisualEdit statement end", "[visualedit]")
+{
+  const std::string src = "translate([1, 2, 3]) cube(5); // done\ndifference() { cube(4); /* } */ sphere(\"}\"); }\nx";
+  CHECK(VisualEdit::statementEnd(src, src.find(" cube")) == src.find(" //"));
+  const size_t diff = src.find("difference()") + 12;
+  CHECK(VisualEdit::statementEnd(src, diff) == src.rfind('}') + 1);
+  CHECK(VisualEdit::statementEnd("cube(1)", 7) == std::string::npos);
+}
+
+TEST_CASE("VisualEdit cuts", "[visualedit]")
+{
+  SECTION("a plain statement is wrapped in difference()")
+  {
+    const std::string src = "a = 1;\n  translate([0, 0, -8])\n    cube(8);\nsphere(1);\n";
+    const size_t start = src.find("translate");
+    size_t cut = 0;
+    const std::string out = VisualEdit::addCut(src, start, src.find(")\n") + 1, false, "#hole()", &cut);
+    CHECK(out ==
+          "a = 1;\n  difference() {\n    translate([0, 0, -8])\n      cube(8);\n    #hole();\n  }\nsphere(1);\n");
+    CHECK(out.compare(cut, 7, "#hole()") == 0);
+  }
+  SECTION("modifiers stay with the wrapped statement")
+  {
+    const std::string src = "# cube(8);";
+    size_t cut = 0;
+    CHECK(VisualEdit::addCut(src, 2, 9, false, "h()", &cut) == "difference() {\n  # cube(8);\n  h();\n}");
+  }
+  SECTION("a difference() block gets the cut before its closing brace")
+  {
+    const std::string src = "difference() {\n  cube(8);\n}\n";
+    size_t cut = 0;
+    const std::string out = VisualEdit::addCut(src, 0, 12, true, "#hole()", &cut);
+    CHECK(out == "difference() {\n  cube(8);\n  #hole();\n}\n");
+    CHECK(out.compare(cut, 7, "#hole()") == 0);
+  }
+  SECTION("one-line difference() block")
+  {
+    const std::string src = "difference() { cube(8); }";
+    size_t cut = 0;
+    const std::string out = VisualEdit::addCut(src, 0, 12, true, "h()", &cut);
+    CHECK(out == "difference() { cube(8); \n  h();\n}");
+    CHECK(out.compare(cut, 3, "h()") == 0);
+  }
+  SECTION("CRLF files keep CRLF")
+  {
+    const std::string src = "cube(8);\r\n";
+    size_t cut = 0;
+    CHECK(VisualEdit::addCut(src, 0, 7, false, "h()", &cut) == "difference() {\r\n  cube(8);\r\n  h();\r\n}\r\n");
+  }
+}
+
+TEST_CASE("VisualEdit placement on faces", "[visualedit]")
+{
+  CHECK(VisualEdit::placementPrefix(Vector3d(1, 2, 3), Vector3d::UnitZ()) == "translate([1, 2, 3]) ");
+  CHECK(VisualEdit::placementPrefix(Vector3d(0, 0, 0), -Vector3d::UnitZ()) ==
+        "translate([0, 0, 0]) rotate([180, 0, 0]) ");
+  // rotate() must turn +Z into the normal for every axis-aligned face.
+  for (const Vector3d& n : std::vector<Vector3d>{Vector3d(1, 0, 0), Vector3d(-1, 0, 0), Vector3d(0, 1, 0),
+                            Vector3d(0, -1, 0), Vector3d(0.6, 0, 0.8)}) {
+    const Vector3d a = VisualEdit::anglesForNormal(n) * M_PI / 180.0;
+    const Eigen::Matrix3d r = (Eigen::AngleAxisd(a[2], Vector3d::UnitZ()) * Eigen::AngleAxisd(a[1], Vector3d::UnitY()) *
+                               Eigen::AngleAxisd(a[0], Vector3d::UnitX()))
+                                .toRotationMatrix();
+    CHECK((r * Vector3d::UnitZ() - n.normalized()).norm() < 1e-9);
+  }
+}
+
+TEST_CASE("VisualEdit color", "[visualedit]")
+{
+  SECTION("statement without color gets one")
+  {
+    const std::string src = "translate([1, 0, 0]) cube(8);";
+    auto file = parseSource(src);
+    CHECK(applyEdits(src, VisualEdit::planColor(statement(file, 0), Vector3d(1, 0.5, 0))) ==
+          "color(\"#ff8000\") translate([1, 0, 0]) cube(8);");
+  }
+  SECTION("existing named color is replaced, also below a translate")
+  {
+    const std::string src = "translate([1, 0, 0]) color(\"red\") cube(8);";
+    auto file = parseSource(src);
+    CHECK(applyEdits(src, VisualEdit::planColor(statement(file, 0), Vector3d(0, 0, 1))) ==
+          "translate([1, 0, 0]) color(\"#0000ff\") cube(8);");
+  }
+  SECTION("existing rgb vector keeps its form")
+  {
+    const std::string src = "color([1, 0, 0, 0.5]) cube(8);";
+    auto file = parseSource(src);
+    CHECK(applyEdits(src, VisualEdit::planColor(statement(file, 0), Vector3d(0, 1, 0.25))) ==
+          "color([0, 1, 0.25, 0.5]) cube(8);");
+  }
+  SECTION("computed colors are left alone")
+  {
+    const std::string src = "c = \"red\";\ncolor(c) cube(8);";
+    auto file = parseSource(src);
+    CHECK(VisualEdit::planColor(statement(file, 0), Vector3d(0, 1, 0)).empty());
+  }
+}

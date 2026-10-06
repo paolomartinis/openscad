@@ -1,5 +1,6 @@
 #include "gui/VisualEdit.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <memory>
@@ -174,6 +175,30 @@ Vector3d matrixToEuler(const Eigen::Matrix3d& m)
 
 }  // namespace
 
+namespace {
+
+// Offset of the first character that is not whitespace or a comment.
+size_t skipBlank(const std::string& text, size_t i)
+{
+  while (i < text.size()) {
+    if (std::isspace(static_cast<unsigned char>(text[i]))) {
+      ++i;
+    } else if (text.compare(i, 2, "//") == 0) {
+      i = text.find('\n', i);
+      if (i == std::string::npos) return text.size();
+    } else if (text.compare(i, 2, "/*") == 0) {
+      i = text.find("*/", i + 2);
+      if (i == std::string::npos) return text.size();
+      i += 2;
+    } else {
+      break;
+    }
+  }
+  return i;
+}
+
+}  // namespace
+
 std::string formatNumber(double v)
 {
   const double rounded = std::round(v * 1e6) / 1e6;
@@ -284,6 +309,134 @@ std::vector<TextEdit> planScale(const ModuleInstantiation& inst, const Vector3d&
   }
 
   return {prefixStatement(inst, sandwichText(anchor, "scale", factors))};
+}
+std::vector<TextEdit> planColor(const ModuleInstantiation& inst, const Vector3d& rgb)
+{
+  // An existing color() on the statement or its single-child chain.
+  for (const ModuleInstantiation *current = &inst; current; current = onlyChild(*current)) {
+    if (current->name() != "color") continue;
+    const Expression *value = argument(*current, "c", 0);
+    const auto *literal = dynamic_cast<const Literal *>(value);
+    if (literal && literal->isString()) {
+      char hex[16];
+      std::snprintf(hex, sizeof(hex), "\"#%02x%02x%02x\"", static_cast<int>(std::round(rgb[0] * 255)),
+                    static_cast<int>(std::round(rgb[1] * 255)), static_cast<int>(std::round(rgb[2] * 255)));
+      return {replaceAt(value->location(), hex)};
+    }
+    const auto *vec = dynamic_cast<const Vector *>(value);
+    if (vec && (vec->getChildren().size() == 3 || vec->getChildren().size() == 4)) {
+      std::vector<TextEdit> edits;
+      for (size_t i = 0; i < 3; ++i) {
+        if (!literalNumber(vec->getChildren()[i].get())) return {};
+        edits.push_back(replaceAt(vec->getChildren()[i]->location(), formatNumber(std::round(rgb[i] * 1000) / 1000)));
+      }
+      return edits;
+    }
+    return {};  // computed color: leave the code alone
+  }
+
+  char hex[32];
+  std::snprintf(hex, sizeof(hex), "color(\"#%02x%02x%02x\") ", static_cast<int>(std::round(rgb[0] * 255)),
+                static_cast<int>(std::round(rgb[1] * 255)), static_cast<int>(std::round(rgb[2] * 255)));
+  return {prefixStatement(inst, hex)};
+}
+
+Vector3d anglesForNormal(const Vector3d& normal)
+{
+  const Vector3d n = normal.normalized();
+  // Exact angles for faces along the axes.
+  const struct {
+    Vector3d n;
+    Vector3d angles;
+  } aligned[] = {
+    {Vector3d::UnitZ(), {0, 0, 0}},   {-Vector3d::UnitZ(), {180, 0, 0}}, {Vector3d::UnitX(), {0, 90, 0}},
+    {-Vector3d::UnitX(), {0, -90, 0}}, {Vector3d::UnitY(), {-90, 0, 0}}, {-Vector3d::UnitY(), {90, 0, 0}},
+  };
+  for (const auto& a : aligned) {
+    if ((n - a.n).norm() < 1e-9) return a.angles;
+  }
+  return matrixToEuler(Eigen::Quaterniond::FromTwoVectors(Vector3d::UnitZ(), n).toRotationMatrix());
+}
+
+std::string placementPrefix(const Vector3d& point, const Vector3d& normal)
+{
+  std::string prefix = "translate(" + vectorText(point) + ") ";
+  const Vector3d angles = anglesForNormal(normal);
+  if (angles.cwiseAbs().maxCoeff() > 1e-9) prefix += "rotate(" + vectorText(angles) + ") ";
+  return prefix;
+}
+
+size_t statementEnd(const std::string& text, size_t argsEnd)
+{
+  int depth = 0;
+  for (size_t i = argsEnd; i < text.size(); ++i) {
+    const char c = text[i];
+    if (c == '/' && (text.compare(i, 2, "//") == 0 || text.compare(i, 2, "/*") == 0)) {
+      i = skipBlank(text, i) - 1;
+    } else if (c == '"') {
+      for (++i; i < text.size() && text[i] != '"'; ++i) {
+        if (text[i] == '\\') ++i;
+      }
+    } else if (c == '(' || c == '[' || c == '{') {
+      ++depth;
+    } else if (c == ')' || c == ']' || c == '}') {
+      if (--depth == 0 && c == '}') return i + 1;
+      if (depth < 0) return std::string::npos;
+    } else if (c == ';' && depth == 0) {
+      return i + 1;
+    }
+  }
+  return std::string::npos;
+}
+
+std::string addCut(const std::string& text, size_t start, size_t argsEnd, bool isDifference,
+                   const std::string& cut, size_t *cutOffset)
+{
+  const std::string eol = text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+
+  // Include modifiers written before the statement ("#cube()", "% sphere()").
+  size_t begin = start;
+  for (size_t i = start; i > 0;) {
+    const char c = text[--i];
+    if (c == '#' || c == '%' || c == '!' || c == '*') begin = i;
+    else if (c != ' ' && c != '\t') break;
+  }
+  // Indentation of the statement when it starts its line.
+  const size_t lineStart = text.rfind('\n', begin == 0 ? 0 : begin - 1);
+  const size_t indentFrom = lineStart == std::string::npos ? 0 : lineStart + 1;
+  std::string indent = text.substr(indentFrom, begin - indentFrom);
+  if (indent.find_first_not_of(" \t") != std::string::npos) indent.clear();
+
+  const size_t end = statementEnd(text, argsEnd);
+  if (end == std::string::npos) return {};
+
+  const size_t brace = skipBlank(text, argsEnd);
+  if (isDifference && brace < text.size() && text[brace] == '{') {
+    // Append inside the existing block, before its closing brace.
+    const size_t close = end - 1;
+    const size_t closeLine = text.rfind('\n', close);
+    const bool braceOnOwnLine =
+      closeLine != std::string::npos && text.find_first_not_of(" \t\r", closeLine + 1) == close;
+    std::string insertion;
+    size_t at;
+    if (braceOnOwnLine) {
+      at = closeLine + 1;
+      insertion = indent + "  " + cut + ";" + eol;
+      *cutOffset = at + indent.size() + 2;
+    } else {
+      at = close;
+      insertion = eol + indent + "  " + cut + ";" + eol + indent;
+      *cutOffset = at + eol.size() + indent.size() + 2;
+    }
+    return text.substr(0, at) + insertion + text.substr(at);
+  }
+
+  // Wrap the statement: difference() { <statement> <cut>; }
+  std::string body = text.substr(begin, end - begin);
+  for (size_t i = 0; (i = body.find('\n', i)) != std::string::npos; i += 3) body.insert(i + 1, "  ");
+  const std::string head = "difference() {" + eol + indent + "  " + body + eol + indent + "  ";
+  *cutOffset = begin + head.size();
+  return text.substr(0, begin) + head + cut + ";" + eol + indent + "}" + text.substr(end);
 }
 
 }  // namespace VisualEdit

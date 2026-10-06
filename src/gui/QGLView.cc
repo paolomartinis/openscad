@@ -53,6 +53,7 @@
 #include <QDialogButtonBox>
 #include <QMouseEvent>
 #include <QKeyEvent>
+#include <QCursor>
 #include <QPainter>
 #include <QPainterPath>
 #include <QMessageBox>
@@ -224,6 +225,7 @@ void QGLView::paintGL()
 {
   GLView::paintGL();
   if (gizmo.visible && gizmo.active != TransformGizmo::None) drawGizmoReadout();
+  if (placement_active && placement.visible) drawPlacementReadout();
 
   if (statusLabel) {
     auto status = QString("%1 (%2x%3)")
@@ -238,7 +240,7 @@ void QGLView::mousePressEvent(QMouseEvent *event)
 {
   if (gizmo_input && !gizmo_dragging) gizmoCancel();
   if (event->button() == Qt::LeftButton && measure_state == Measurement::MEASURE_IDLE &&
-      gizmoStartDrag(event->position())) {
+      !placement_active && gizmoStartDrag(event->position())) {
     return;
   }
 
@@ -356,6 +358,7 @@ void QGLView::mouseMoveEvent(QMouseEvent *event)
 #else
   auto this_mouse = event->globalPos();
 #endif
+  if (placement_active && !mouse_drag_active) updatePlacement(event->position());
   if (gizmo.active != TransformGizmo::None) {
     gizmo_last_pos = event->position();
     if (gizmo_dragging) gizmoUpdateDrag(event->position());
@@ -478,6 +481,15 @@ void QGLView::mouseReleaseEvent(QMouseEvent *event)
 
   mouse_drag_active = false;
   releaseMouse();
+
+  if (placement_active && !mouse_drag_moved && event->button() == Qt::LeftButton) {
+    updatePlacement(event->position());
+    const auto& m = placement;
+    emit placementChosen(placement_on_surface, m.point.x(), m.point.y(), m.point.z(), m.normal.x(),
+                         m.normal.y(), m.normal.z(), event->pos());
+    mouse_drag_moved = false;
+    return;
+  }
 
   if (!mouse_drag_moved) {
     if (event->button() == Qt::RightButton) {
@@ -996,6 +1008,19 @@ void QGLView::keyPressEvent(QKeyEvent *event)
   const int key = event->key();
   const bool tab = key == Qt::Key_Tab || key == Qt::Key_Backtab;
 
+  if (placement_active && key == Qt::Key_Escape) {
+    stopPlacement();
+    emit placementCancelled();
+    event->accept();
+    return;
+  }
+  if (key == Qt::Key_C && event->modifiers() == Qt::NoModifier && gizmo.visible &&
+      gizmo.active == G::None) {
+    emit colorRequested();
+    event->accept();
+    return;
+  }
+
   // Like AutoCAD dynamic input, Tab switches to typed values: on the edit
   // being dragged, on the hovered handle, or else a free X/Y/Z move.
   if (tab && gizmo.active == G::None && gizmo.visible) {
@@ -1142,6 +1167,153 @@ void QGLView::drawGizmoReadout()
   painter.setFont(small);
   painter.setPen(QColor(170, 170, 170));
   painter.drawText(QPointF(box.left() + pad, box.bottom() - pad - fms.descent()), hint);
+}
+
+void QGLView::startPlacement(const QString& label, double markerRadius)
+{
+  placement_active = true;
+  placement_label = label;
+  placement.radius = markerRadius;
+  placement.visible = false;
+  gizmoCancel();
+  setFocus();
+  const QPoint mouse = mapFromGlobal(QCursor::pos());
+  if (rect().contains(mouse)) updatePlacement(mouse);
+}
+
+void QGLView::stopPlacement()
+{
+  placement_active = false;
+  placement.visible = false;
+  update();
+}
+
+// Point and outward normal of the visible surface under `pos`, from the depth
+// buffer (normal from the neighbouring pixels).
+bool QGLView::surfaceAt(const QPointF& pos, Vector3d& point, Vector3d& normal)
+{
+  if (!isValid()) return false;
+  makeCurrent();
+  auto guard = sg::make_scope_guard([this]() { this->doneCurrent(); });
+
+  const double dpr = devicePixelRatioF();
+  const int w = static_cast<int>(width() * dpr), h = static_cast<int>(height() * dpr);
+  const Eigen::Map<const Eigen::Matrix4d> model(this->modelview);
+  const Eigen::Map<const Eigen::Matrix4d> proj(this->projection);
+  const Eigen::Matrix4d inv = (proj * model).inverse();
+  auto unproject = [&](int px, int py, Vector3d& out) {
+    if (px < 0 || py < 0 || px >= w || py >= h) return false;
+    GLfloat depth = 1.0f;
+    glReadPixels(px, h - 1 - py, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &depth);
+    if (depth >= 1.0f) return false;  // background
+    const Eigen::Vector4d ndc(2.0 * (px + 0.5) / w - 1.0, 1.0 - 2.0 * (py + 0.5) / h, 2.0 * depth - 1.0, 1.0);
+    const Eigen::Vector4d world = inv * ndc;
+    out = world.head<3>() / world.w();
+    return true;
+  };
+
+  const int cx = static_cast<int>(pos.x() * dpr), cy = static_cast<int>(pos.y() * dpr);
+  const int d = std::max(2, static_cast<int>(3 * dpr));
+  if (!unproject(cx, cy, point)) return false;
+
+  auto difference = [&](int ax, int ay, int bx, int by, Vector3d& out) {
+    Vector3d a, b;
+    const bool hasA = unproject(ax, ay, a), hasB = unproject(bx, by, b);
+    if (hasA && hasB) out = b - a;
+    else if (hasB) out = b - point;
+    else if (hasA) out = point - a;
+    else return false;
+    return true;
+  };
+  Vector3d dx, dy;
+  Vector3d nearPt, farPt;
+  screenRay(pos, nearPt, farPt);
+  const Vector3d view = (farPt - nearPt).normalized();
+  if (difference(cx - d, cy, cx + d, cy, dx) && difference(cx, cy - d, cx, cy + d, dy) &&
+      dx.cross(dy).norm() > 1e-12) {
+    normal = dx.cross(dy).normalized();
+  } else {
+    normal = -view;
+  }
+  if (normal.dot(view) > 0) normal = -normal;  // face the viewer
+  return true;
+}
+
+void QGLView::updatePlacement(const QPointF& pos)
+{
+  const bool fine = QApplication::keyboardModifiers() & Qt::ControlModifier;
+  const double step = fine ? 0.1 : 1.0;
+  auto snap = [step](double v) { return std::round(v / step) * step; };
+
+  Vector3d point, normal;
+  placement_on_surface = surfaceAt(pos, point, normal);
+  if (placement_on_surface) {
+    // Faces within 12 degrees of an axis count as axis-aligned.
+    int alignedAxis = -1;
+    for (int axis = 0; axis < 3; ++axis) {
+      if (std::fabs(normal[axis]) > std::cos(12.0 * M_PI / 180.0)) {
+        alignedAxis = axis;
+        normal = Vector3d::Unit(axis) * (normal[axis] > 0 ? 1.0 : -1.0);
+      }
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+      if (alignedAxis < 0) point[axis] = std::round(point[axis] * 1000) / 1000;
+      else if (axis == alignedAxis) point[axis] = std::round(point[axis] * 1000) / 1000;
+      else point[axis] = snap(point[axis]);  // grid in the face plane
+    }
+  } else {
+    if (!rayHitsPlaneZ(pos, 0.0, point)) {
+      placement.visible = false;
+      update();
+      return;
+    }
+    point = Vector3d(snap(point.x()), snap(point.y()), 0.0);
+    normal = Vector3d::UnitZ();
+  }
+  placement.point = point;
+  placement.normal = normal;
+  placement.visible = true;
+  gizmo_last_pos = pos;
+  update();
+}
+
+void QGLView::drawPlacementReadout()
+{
+  static const char *axisNames[] = {"X", "Y", "Z"};
+  QString where = placement_on_surface ? "on face" : "on the ground";
+  for (int axis = 0; axis < 3; ++axis) {
+    if (std::fabs(std::fabs(placement.normal[axis]) - 1.0) < 1e-9) {
+      where += QString(" %1%2").arg(placement.normal[axis] > 0 ? "+" : "-").arg(axisNames[axis]);
+    }
+  }
+  const QString coords = QString("[%1, %2, %3]")
+                           .arg(formatValue(placement.point.x(), 2))
+                           .arg(formatValue(placement.point.y(), 2))
+                           .arg(formatValue(placement.point.z(), 2));
+  const QStringList lines{placement_label, where + "  " + coords, "click: place - drag: orbit - Esc: cancel"};
+
+  QPainter painter(this);
+  painter.setRenderHint(QPainter::Antialiasing);
+  QFont font = painter.font();
+  font.setBold(true);
+  const QFontMetrics fm(font);
+  const int pad = 6;
+  int width = 0;
+  for (const auto& line : lines) width = std::max(width, fm.horizontalAdvance(line));
+  width += 2 * pad;
+  const int height = fm.height() * lines.size() + 2 * pad;
+  QPointF origin = gizmo_last_pos + QPointF(18, 18);
+  origin.setX(std::min(origin.x(), this->width() - width - 4.0));
+  origin.setY(std::min(origin.y(), this->height() - height - 4.0));
+  const QRectF box(origin, QSizeF(width, height));
+  painter.setPen(Qt::NoPen);
+  painter.setBrush(QColor(25, 25, 28, 225));
+  painter.drawRoundedRect(box, 6, 6);
+  for (int i = 0; i < lines.size(); ++i) {
+    painter.setFont(i == 0 ? font : QFont(painter.font().family(), font.pointSize() - 1));
+    painter.setPen(i == 2 ? QColor(170, 170, 170) : QColor(235, 235, 235));
+    painter.drawText(QPointF(box.left() + pad, box.top() + pad + fm.ascent() + i * fm.height()), lines[i]);
+  }
 }
 
 int QGLView::pickObject(QPoint position)
