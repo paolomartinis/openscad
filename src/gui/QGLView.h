@@ -19,6 +19,7 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <functional>
 #include <set>
 #include "glview/GLView.h"
 #include "../core/MouseConfig.h"
@@ -62,6 +63,9 @@ public:
   void startPlacement(const QString& label, double markerRadius);
   void stopPlacement();
   bool placementActive() const { return placement_active; }
+  // Finds the visible surface along a world ray (origin, direction): point,
+  // outward normal and the node index of the leaf hit. Set by MainWindow.
+  std::function<bool(const Vector3d&, const Vector3d&, Vector3d&, Vector3d&, int&)> surfaceProvider;
 
   // Leaf node indices of the current visual-editor selection; pressing on
   // one of them starts a drag on the XY plane.
@@ -131,6 +135,7 @@ private:
   void drawPlacementReadout();
   bool placement_active = false;
   bool placement_on_surface = false;
+  int placement_leaf = -1;
   QString placement_label;
   bool gizmo_dragging = false;           // mouse button held on a handle
   bool gizmo_input = false;              // values typed on the keyboard (opened with Tab)
@@ -175,7 +180,7 @@ signals:
   void gizmoCommitted(int handle, double a, double b, double c);
   // Placement click: point and outward normal of the face (or the ground).
   void placementChosen(bool onSurface, double px, double py, double pz, double nx, double ny, double nz,
-                       QPoint position);
+                       int leafIndex);
   void placementCancelled();
   // "C" pressed with a selection.
   void colorRequested();

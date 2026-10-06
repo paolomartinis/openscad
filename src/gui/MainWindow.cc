@@ -142,6 +142,7 @@
 #include "gui/QWordSearchField.h"
 #include "gui/ScintillaEditor.h"
 #include "gui/VisualEdit.h"
+#include "gui/SurfacePick.h"
 #include <QInputDialog>
 #include <QColorDialog>
 #include <QRegularExpression>
@@ -2641,7 +2642,7 @@ bool MainWindow::applySourceEdits(const std::vector<VisualEdit::TextEdit>& edits
 }
 
 void MainWindow::onPlacementChosen(bool onSurface, double px, double py, double pz, double nx, double ny,
-                                   double nz, QPoint position)
+                                   double nz, int leafIndex)
 {
   auto *editor = dynamic_cast<ScintillaEditor *>(activeEditor);
   if (!editor || pendingPart.call.isEmpty()) {
@@ -2671,8 +2672,7 @@ void MainWindow::onPlacementChosen(bool onSurface, double px, double py, double 
   if (pendingPart.hole && onSurface && this->rootNode && editor->toPlainText() == lastCompiledDoc) {
     // Cut the hole from the outermost statement of the clicked object.
     std::deque<std::shared_ptr<const AbstractNode>> path;
-    const int index = this->qglview->pickObject(position);
-    const auto picked = index >= 0 ? this->rootNode->getNodeByID(index, path) : nullptr;
+    const auto picked = leafIndex >= 0 ? this->rootNode->getNodeByID(leafIndex, path) : nullptr;
     const auto chain = picked ? visualSelectionChain(path) : decltype(visualSelectionChain(path)){};
     if (!chain.empty()) {
       const ModuleInstantiation& target = *chain.front()->modinst;
@@ -4286,6 +4286,16 @@ void MainWindow::setup3DView()
   connect(this->qglview, &QGLView::doLeftClick, this, &MainWindow::leftClick);
   connect(this->qglview, &QGLView::gizmoCommitted, this, &MainWindow::onGizmoCommitted);
   connect(this->qglview, &QGLView::placementChosen, this, &MainWindow::onPlacementChosen);
+  this->qglview->surfaceProvider = [this](const Vector3d& origin, const Vector3d& direction, Vector3d& point,
+                                          Vector3d& normal, int& leaf) {
+    if (!this->rootProduct) return false;
+    const auto hit = SurfacePick::castRay(*this->rootProduct, origin, direction);
+    if (!hit) return false;
+    point = hit->point;
+    normal = hit->normal;
+    leaf = hit->leafIndex;
+    return true;
+  };
   connect(this->qglview, &QGLView::placementCancelled, this,
           [this]() { this->statusBar()->showMessage("Insert cancelled"); });
   connect(this->qglview, &QGLView::colorRequested, this, &MainWindow::colorSelection);

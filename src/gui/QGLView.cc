@@ -486,7 +486,7 @@ void QGLView::mouseReleaseEvent(QMouseEvent *event)
     updatePlacement(event->position());
     const auto& m = placement;
     emit placementChosen(placement_on_surface, m.point.x(), m.point.y(), m.point.z(), m.normal.x(),
-                         m.normal.y(), m.normal.z(), event->pos());
+                         m.normal.y(), m.normal.z(), placement_on_surface ? placement_leaf : -1);
     mouse_drag_moved = false;
     return;
   }
@@ -1188,55 +1188,14 @@ void QGLView::stopPlacement()
   update();
 }
 
-// Point and outward normal of the visible surface under `pos`, from the depth
-// buffer (normal from the neighbouring pixels).
+// Point and outward normal of the visible surface under `pos`.
 bool QGLView::surfaceAt(const QPointF& pos, Vector3d& point, Vector3d& normal)
 {
-  if (!isValid()) return false;
-  makeCurrent();
-  auto guard = sg::make_scope_guard([this]() { this->doneCurrent(); });
-
-  const double dpr = devicePixelRatioF();
-  const int w = static_cast<int>(width() * dpr), h = static_cast<int>(height() * dpr);
-  const Eigen::Map<const Eigen::Matrix4d> model(this->modelview);
-  const Eigen::Map<const Eigen::Matrix4d> proj(this->projection);
-  const Eigen::Matrix4d inv = (proj * model).inverse();
-  auto unproject = [&](int px, int py, Vector3d& out) {
-    if (px < 0 || py < 0 || px >= w || py >= h) return false;
-    GLfloat depth = 1.0f;
-    glReadPixels(px, h - 1 - py, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &depth);
-    if (depth >= 1.0f) return false;  // background
-    const Eigen::Vector4d ndc(2.0 * (px + 0.5) / w - 1.0, 1.0 - 2.0 * (py + 0.5) / h, 2.0 * depth - 1.0, 1.0);
-    const Eigen::Vector4d world = inv * ndc;
-    out = world.head<3>() / world.w();
-    return true;
-  };
-
-  const int cx = static_cast<int>(pos.x() * dpr), cy = static_cast<int>(pos.y() * dpr);
-  const int d = std::max(2, static_cast<int>(3 * dpr));
-  if (!unproject(cx, cy, point)) return false;
-
-  auto difference = [&](int ax, int ay, int bx, int by, Vector3d& out) {
-    Vector3d a, b;
-    const bool hasA = unproject(ax, ay, a), hasB = unproject(bx, by, b);
-    if (hasA && hasB) out = b - a;
-    else if (hasB) out = b - point;
-    else if (hasA) out = point - a;
-    else return false;
-    return true;
-  };
-  Vector3d dx, dy;
+  placement_leaf = -1;
+  if (!surfaceProvider) return false;
   Vector3d nearPt, farPt;
   screenRay(pos, nearPt, farPt);
-  const Vector3d view = (farPt - nearPt).normalized();
-  if (difference(cx - d, cy, cx + d, cy, dx) && difference(cx, cy - d, cx, cy + d, dy) &&
-      dx.cross(dy).norm() > 1e-12) {
-    normal = dx.cross(dy).normalized();
-  } else {
-    normal = -view;
-  }
-  if (normal.dot(view) > 0) normal = -normal;  // face the viewer
-  return true;
+  return surfaceProvider(nearPt, farPt - nearPt, point, normal, placement_leaf);
 }
 
 void QGLView::updatePlacement(const QPointF& pos)

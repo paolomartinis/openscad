@@ -477,7 +477,7 @@ private:
   void addHardwareMenu();
   void insertHardware(const QString& module, const QString& size, int lengthKind, bool thread);
   void onPlacementChosen(bool onSurface, double px, double py, double pz, double nx, double ny,
-                         double nz, QPoint position);
+                         double nz, int leafIndex);
   void colorSelection();
   bool applySourceEdits(const std::vector<VisualEdit::TextEdit>& edits);
   void replaceSourceText(const std::string& newText);
